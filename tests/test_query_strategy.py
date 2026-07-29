@@ -72,7 +72,7 @@ def test_fwhm_detects_peak(dataset_1d):
     op = FullWidthHalfMaximum1D()
     result = op.calculate(dataset_1d)
     out = result.output[op.output_variable].values
-    # The default includes the global maximum as well as both FWHM points.
+    # The default includes the peak/global maximum and both FWHM points.
     assert np.isclose(out, 4).any()
     assert out.shape == (3,)
     assert np.isclose(out, 2.5).any()
@@ -94,7 +94,7 @@ def test_fwhm_includes_boundary_global_maximum_by_default():
     out = result.output["temperature_next"].values
 
     # The boundary maximum is not detected by scipy's find_peaks.
-    assert np.allclose(out, [0, 1.5, 2.5])
+    assert np.allclose(out, [0, 1.5, 2, 2.5])
 
 
 def test_fwhm_can_exclude_global_maximum():
@@ -111,8 +111,17 @@ def test_fwhm_can_exclude_global_maximum():
     result = op.calculate(dataset)
     out = result.output[op.output_variable].values
 
-    assert out.shape == (2,)
-    assert np.allclose(out, [1.5, 2.5])
+    assert out.shape == (3,)
+    assert np.allclose(out, [1.5, 2, 2.5])
+
+
+def test_fwhm_results_are_unique_to_two_decimal_places():
+    x = np.array([0.0, 1.001, 1.002, 1.004, 2.0])
+    utility = np.array([0.0, 10.0, 0.0, 9.0, 0.0])
+
+    out = FullWidthHalfMaximum1D().optimize(x, utility)
+
+    assert np.allclose(out, [0.5, 1.0, 1.5])
 
 
 def test_fwhm_no_peak_returns_max():

@@ -83,8 +83,8 @@ class ArgMax(PipelineOp):
 
 class FullWidthHalfMaximum1D(PipelineOp):
     """
-    Find peaks in a 1D utility and compute their full-width-half-maximum
-    points, optionally including the global maximum.
+    Find peaks in a 1D utility and compute their locations and
+    full-width-half-maximum points, optionally including the global maximum.
 
     Parameters
     ----------
@@ -144,8 +144,8 @@ class FullWidthHalfMaximum1D(PipelineOp):
         self : FullWidthHalfMaximum1D
             Returns self with `output` containing:
             
-            - `output_variable`: FWHM locations for each peak and, by default,
-              the global maximum location.
+            - `output_variable`: Peak and FWHM locations for each peak and,
+              by default, the global maximum location.
         """
         u = dataset[self.input_variable]
         x = dataset[self.grid_variable]
@@ -161,8 +161,8 @@ class FullWidthHalfMaximum1D(PipelineOp):
                             )
         self.output[self.output_variable] = output
         self.output[self.output_variable].attrs["description"] = textwrap.dedent("""
-        Optimal 1D locations at the full-width-half-maximum points of utility
-        peaks, optionally including the global maximum.
+        Optimal 1D locations at utility peaks and their full-width-half-maximum
+        points, optionally including the global maximum.
         """).strip()
         return self
 
@@ -187,9 +187,10 @@ class FullWidthHalfMaximum1D(PipelineOp):
         Returns
         -------
         xb : np.ndarray
-            Sorted array of x values. For each peak, its left and right
-            half-maximum locations are returned. The global maximum location is
-            also returned when ``include_global_maximum`` is True.
+            Sorted array of x values, rounded to two decimal places and unique
+            at that precision. For each peak, its left half-maximum, peak, and
+            right half-maximum locations are returned. The global maximum
+            location is also returned when ``include_global_maximum`` is True.
         """
         x = np.asarray(x)
         f = np.asarray(f).squeeze()
@@ -209,8 +210,9 @@ class FullWidthHalfMaximum1D(PipelineOp):
             xb = []
             for i, peak_idx in enumerate(peaks):
                 left_x = np.interp(left_ips[i], np.arange(len(x)), x)
+                peak_x = x[peak_idx]
                 right_x = np.interp(right_ips[i], np.arange(len(x)), x)
-                xb.extend([left_x, right_x])
+                xb.extend([left_x, peak_x, right_x])
 
             xb = np.array(xb)
         else:
@@ -219,7 +221,7 @@ class FullWidthHalfMaximum1D(PipelineOp):
         if include_global_maximum:
             xb = np.append(xb, x[np.argmax(f)])
 
-        return np.sort(xb)
+        return np.unique(np.round(xb, decimals=2))
     
 class MinMax1DLineSampler(PipelineOp):
     """
