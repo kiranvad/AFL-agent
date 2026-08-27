@@ -7,8 +7,18 @@ from pathlib import Path
 import numpy as np
 import xarray as xr
 
-from AFL.automation.APIServer.Driver import Driver
-from AFL.automation.instrument.VirtualInstrument import VirtualInstrument
+from AFL.double_agent._automation_compat import Driver
+
+try:
+    from AFL.automation.instrument.VirtualInstrument import VirtualInstrument
+except ModuleNotFoundError as exc:
+    if exc.name and exc.name.startswith("AFL.automation"):
+        # The virtual instrument API is useful without an APIServer. Preserve
+        # its public inheritance shape while using the same lightweight Driver
+        # fallback as AgentDriver when AFL-automation is not installed.
+        VirtualInstrument = Driver
+    else:
+        raise
 
 
 class GaussianVirtualInstrument(VirtualInstrument):
