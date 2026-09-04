@@ -30,7 +30,9 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install -e ".[dev,pytorch,botorch,apdist]"
+        # apdist cannot currently be built on GitHub-hosted runners. Its tests
+        # skip automatically when the optional dependency is unavailable.
+        pip install -e ".[dev,pytorch,botorch]"
         
     - name: Run tests
       run: |

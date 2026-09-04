@@ -1,11 +1,17 @@
 """Tests for amplitude-phase target scoring."""
 
+from importlib.util import find_spec
+
 import numpy as np
 import pytest
 import xarray as xr
 
 from AFL.double_agent.AmplitudePhaseDistance import AmplitudePhaseTargetScore
 from AFL.double_agent.PipelineOp import PipelineOp
+
+pytestmark = pytest.mark.skipif(
+    find_spec("apdist") is None, reason="apdist is an optional dependency"
+)
 
 
 def test_amplitude_phase_target_score_defaults():
@@ -21,7 +27,6 @@ def test_amplitude_phase_target_score_defaults():
 
 
 def test_amplitude_phase_target_score_calculate():
-    pytest.importorskip("apdist")
     domain = np.linspace(350.0, 850.0, 101)
     target = np.exp(-0.5 * ((domain - 600.0) / 40.0) ** 2)
     shifted = np.exp(-0.5 * ((domain - 650.0) / 40.0) ** 2)
