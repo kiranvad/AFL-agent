@@ -51,6 +51,92 @@ class Preprocessor(PipelineOp):
         return NotImplementedError(".calculate must be implemented in subclasses")  # type: ignore
 
 
+class UnitCubeTransform(Preprocessor):
+    """Transform component-valued data between physical and unit-cube space.
+
+    The component coordinate is used to align each column with its declared
+    bound, avoiding any dependence on dictionary insertion order.  Set
+    ``inverse=True`` to map unit-cube values back to physical coordinates.
+    """
+
+    def __init__(
+        self,
+        bounds: dict[str, dict[str, float]],
+        input_variable: str,
+        output_variable: str,
+        component_dim: str = "component",
+        inverse: bool = False,
+        name: str = "UnitCubeTransform",
+    ) -> None:
+        if not bounds:
+            raise ValueError("bounds must not be empty")
+        normalized_bounds: dict[str, dict[str, float]] = {}
+        for component, limit in bounds.items():
+            if "min" not in limit or "max" not in limit:
+                raise ValueError(
+                    f"bounds for {component!r} must contain 'min' and 'max'"
+                )
+            lower, upper = float(limit["min"]), float(limit["max"])
+            if not np.isfinite([lower, upper]).all() or lower >= upper:
+                raise ValueError(
+                    f"bounds for {component!r} must be finite with min < max"
+                )
+            normalized_bounds[component] = {"min": lower, "max": upper}
+
+        super().__init__(
+            name=name,
+            input_variable=input_variable,
+            output_variable=output_variable,
+        )
+        self.bounds = normalized_bounds
+        self.component_dim = component_dim
+        self.inverse = bool(inverse)
+
+    def calculate(self, dataset: xr.Dataset) -> Self:
+        values = self._get_variable(dataset)
+        if self.component_dim not in values.dims:
+            raise ValueError(
+                f"{self.input_variable!r} must have dimension {self.component_dim!r}"
+            )
+        if self.component_dim not in values.coords:
+            raise ValueError(
+                f"{self.input_variable!r} must have component-name coordinates"
+            )
+
+        components = list(values[self.component_dim].values)
+        missing = [
+            str(component) for component in components if component not in self.bounds
+        ]
+        if missing:
+            raise ValueError(f"bounds are missing components: {missing}")
+        lower = xr.DataArray(
+            [self.bounds[component]["min"] for component in components],
+            dims=(self.component_dim,),
+            coords={self.component_dim: components},
+        )
+        span = xr.DataArray(
+            [
+                self.bounds[component]["max"] - self.bounds[component]["min"]
+                for component in components
+            ],
+            dims=(self.component_dim,),
+            coords={self.component_dim: components},
+        )
+        transformed = (
+            lower + values * span if self.inverse else (values - lower) / span
+        )
+        transformed = transformed.transpose(*values.dims)
+        transformed.attrs = dict(values.attrs)
+        transformed.attrs.update(
+            {
+                "coordinate_space": "physical" if self.inverse else "unit_cube",
+                "transformed_from": self.input_variable,
+            }
+        )
+        self.output = {self.output_variable: transformed}
+        return self
+
+
 class SplinePreprocessor(Preprocessor):
     """Resample one-dimensional spectra onto a common spline grid.
 

@@ -571,29 +571,77 @@ class DoubleAgentDriver(AgentWebAppMixin, Driver):
         sources = input_spec.get("sources")
         if not isinstance(sources, dict) or not sources:
             raise ValueError("input_spec.sources must be a non-empty dictionary keyed by source name")
+        sample_dim = input_spec.get("sample_dim", "sample")
+        if not isinstance(sample_dim, str) or not sample_dim or sample_dim in sources:
+            raise ValueError("sample_dim must be a non-empty string distinct from source names")
         for name, source in sources.items():
             if not isinstance(name, str) or not name:
                 raise ValueError("input_spec.sources keys must be non-empty strings")
             if not isinstance(source, dict):
                 raise ValueError(f"input_spec.sources[{name!r}] must be a dictionary")
-            required = ("driver_name", "task_name", "source", "path")
-            missing = [key for key in required if not source.get(key)]
-            if missing:
-                raise ValueError(
-                    f"input_spec.sources[{name!r}] missing required keys: {missing}"
+            if "inputs" not in source:
+                DoubleAgentDriver._validate_collection_input(source, f"sources[{name!r}]", require_path=True)
+                continue
+            if any(key in source for key in ("driver_name", "task_name", "source", "path")):
+                raise ValueError(f"sources[{name!r}] cannot mix inputs with single-path selectors")
+            inputs = source["inputs"]
+            if not isinstance(inputs, dict) or not inputs:
+                raise ValueError(f"sources[{name!r}].inputs must be a non-empty dictionary")
+            for input_name, selector in inputs.items():
+                if not isinstance(input_name, str) or not input_name:
+                    raise ValueError("inputs keys must be non-empty strings")
+                DoubleAgentDriver._validate_collection_input(
+                    selector, f"sources[{name!r}].inputs[{input_name!r}]", require_path=False
                 )
-            if source["source"] not in {"dataset", "metadata"}:
-                raise ValueError("source must be either 'dataset' or 'metadata'")
+            mapping = source.get("mapping")
+            if not isinstance(mapping, dict) or not mapping:
+                raise ValueError(f"sources[{name!r}].mapping must be a non-empty dictionary")
+            for field, extraction in mapping.items():
+                if not isinstance(field, str) or not field or not isinstance(extraction, dict):
+                    raise ValueError("mapping must contain named field dictionaries")
+                if not isinstance(extraction.get("input"), str) or extraction["input"] not in inputs:
+                    raise ValueError(f"mapping field {field!r} references an unknown input")
+                if not isinstance(extraction.get("path"), str) or not extraction["path"]:
+                    raise ValueError(f"mapping field {field!r} requires a non-empty path string")
+            if source.get("mapping_to_vector") is not True:
+                raise ValueError("constructed sources require mapping_to_vector=True")
+            dims = source.get("dims")
+            if (not isinstance(dims, list) or len(dims) != 1
+                    or not isinstance(dims[0], str) or not dims[0]
+                    or dims[0] == sample_dim or dims[0] in sources):
+                raise ValueError("constructed sources require exactly one non-sample dims value")
+            coords = source.get("coords")
+            labels = coords.get(dims[0]) if isinstance(coords, dict) else None
+            if (not isinstance(labels, list) or not all(isinstance(label, str) for label in labels)
+                    or len(labels) != len(mapping) or set(labels) != set(mapping)):
+                raise ValueError("constructed source coordinates must list every mapping field exactly once")
         return input_spec
+
+    @staticmethod
+    def _validate_collection_input(source: Any, location: str, require_path: bool) -> None:
+        if not isinstance(source, dict):
+            raise ValueError(f"{location} must be a dictionary")
+        required = ["driver_name", "task_name", "source"]
+        if require_path:
+            required.append("path")
+        missing = [key for key in required if not isinstance(source.get(key), str) or not source[key]]
+        if missing:
+            raise ValueError(f"{location} missing required string keys: {missing}")
+        if source["source"] not in {"dataset", "metadata"}:
+            raise ValueError("source must be either 'dataset' or 'metadata'")
 
     @Driver.queued()
     def setup_data_collection(self, input_spec: Dict[str, Any]) -> Dict[str, Any]:
         """Configure direct Tiled-entry input collection.
 
         The spec requires a ``campaign_id`` and a source-name-to-spec
-        dictionary. Each spec requires ``driver_name``,
-        ``task_name``, ``source`` (``dataset`` or ``metadata``), and ``path``.
-        append_dataset must receive exactly the same source names.
+        dictionary. A single-path spec requires ``driver_name``, ``task_name``,
+        ``source`` (``dataset`` or ``metadata``), and ``path``. A constructed
+        spec instead declares named ``inputs`` with those selectors, a
+        ``mapping`` of field names to input/path pairs, ``mapping_to_vector=True``,
+        one feature ``dims`` value, and ordered field labels in ``coords``.
+        append_dataset receives entry IDs nested by input name for constructed
+        sources and plain entry IDs for single-path sources.
         """
         spec = self._validate_input_spec(input_spec)
         collection = {
@@ -631,7 +679,9 @@ class DoubleAgentDriver(AgentWebAppMixin, Driver):
         self, source: Dict[str, Any], record: Dict[str, Any], sample_dim: str
     ) -> xr.DataArray:
         if source["source"] == "dataset":
-            dataset = self._read_tiled_item(record["item"])
+            if "dataset" not in record:
+                record["dataset"] = self._read_tiled_item(record["item"])
+            dataset = record["dataset"]
             if not isinstance(dataset, xr.Dataset):
                 raise ValueError(f"{record['entry_id']} is not an xarray Dataset")
             if source["path"] not in dataset:
@@ -659,6 +709,44 @@ class DoubleAgentDriver(AgentWebAppMixin, Driver):
             array.reshape((1, *array.shape)), dims=[sample_dim, *dims], coords={sample_dim: [record["sample_id"]]}
         )
 
+    def _constructed_collection_value(
+        self, source: Dict[str, Any], records: Dict[str, Any], sample_dim: str
+    ) -> xr.DataArray:
+        """Build an ordered numeric vector from scalar fields across records."""
+        dim = source["dims"][0]
+        labels = source["coords"][dim]
+        values = []
+        for label in labels:
+            extraction = source["mapping"][label]
+            record = records[extraction["input"]]
+            selector = source["inputs"][extraction["input"]]
+            path = extraction["path"]
+            if selector["source"] == "metadata":
+                raw = self._metadata_path(record["metadata"], path)
+                if raw is None:
+                    raise ValueError(f"{record['entry_id']} has no metadata path {path!r}")
+            else:
+                if "dataset" not in record:
+                    record["dataset"] = self._read_tiled_item(record["item"])
+                dataset = record["dataset"]
+                if not isinstance(dataset, xr.Dataset):
+                    raise ValueError(f"{record['entry_id']} is not an xarray Dataset")
+                if path not in dataset:
+                    raise ValueError(f"{record['entry_id']} has no variable {path!r}")
+                raw = dataset[path].load().values
+            array = np.asarray(raw)
+            if array.ndim != 0:
+                raise ValueError(f"mapping field {label!r} must be scalar, received shape {array.shape}")
+            try:
+                values.append(float(array.item()))
+            except (ValueError, TypeError, OverflowError) as exc:
+                raise ValueError(f"mapping field {label!r} must be numeric") from exc
+        sample_id = next(iter(records.values()))["sample_id"]
+        return xr.DataArray(
+            [values], dims=[sample_dim, dim],
+            coords={sample_dim: [sample_id], dim: labels},
+        )
+
     def _post_dataset_to_tiled(self, dataset: xr.Dataset, kind: str) -> Any:
         """Upload a generated dataset through AFL-automation's Tiled helper."""
         uploader = getattr(self, "tiled_upload_dataset", None)
@@ -678,12 +766,13 @@ class DoubleAgentDriver(AgentWebAppMixin, Driver):
             return {"status": "error", "message": str(exc)}
 
     @Driver.queued()
-    def append_dataset(self, entries: Dict[str, str]) -> Dict[str, Any]:
+    def append_dataset(self, entries: Dict[str, Any]) -> Dict[str, Any]:
         """Append one sample using exact Tiled entry IDs keyed by source name.
 
         ``entries`` must contain exactly the keys in
         ``data_collection.input_spec.sources``. Each entry is read directly
         from ``run_documents``; this method never searches the catalog.
+        Constructed sources accept a dictionary of their input names to IDs.
         """
         collection = self.config.get("data_collection")
         if not collection:
@@ -713,21 +802,56 @@ class DoubleAgentDriver(AgentWebAppMixin, Driver):
             )
 
         sample_dim = spec.get("sample_dim", "sample")
-        records: Dict[str, Dict[str, Any]] = {}
+        requests = []
         for source_name, source in sources.items():
-            entry_id, item = self._get_tiled_item_by_id(entries[source_name])
-            metadata = dict(getattr(item, "metadata", {}) or {})
+            if "inputs" in source:
+                nested = entries[source_name]
+                if not isinstance(nested, dict) or set(nested) != set(source["inputs"]):
+                    raise ValueError(f"entries[{source_name!r}] keys must exactly match its inputs")
+                requests.extend(
+                    ((source_name, input_name), selector, nested[input_name])
+                    for input_name, selector in source["inputs"].items()
+                )
+            else:
+                requests.append(((source_name, None), source, entries[source_name]))
+
+        records = {}
+        cache = {}
+        provenance = {}
+        for key, source, requested_id in requests:
+            source_name, input_name = key
+            location = source_name if input_name is None else f"{source_name}.{input_name}"
+            if not isinstance(requested_id, str) or not requested_id.strip().strip("/"):
+                raise ValueError(f"{location!r} entry ID must be a non-empty string")
+            cache_key = requested_id.strip().strip("/")
+            prefix = f"{self.TILED_RUN_DOCUMENTS_NODE}/"
+            if cache_key.startswith(prefix):
+                cache_key = cache_key[len(prefix):]
+            if cache_key not in cache:
+                entry_id, item = self._get_tiled_item_by_id(requested_id)
+                cache[cache_key] = {
+                    "entry_id": entry_id, "item": item,
+                    "metadata": dict(getattr(item, "metadata", {}) or {}),
+                }
+            record = cache[cache_key]
+            entry_id, metadata = record["entry_id"], record["metadata"]
             if not self._source_matches(metadata, source):
-                raise ValueError(f"{source_name!r} entry {entry_id!r} does not match its driver_name/task_name")
+                raise ValueError(f"{location!r} entry {entry_id!r} does not match its driver_name/task_name")
             campaign_id = self._record_identifier(metadata, "campaign_id", source.get("campaign_id_path"))
             if campaign_id != collection["campaign_id"]:
-                raise ValueError(f"{source_name!r} entry {entry_id!r} does not match campaign {collection['campaign_id']!r}")
+                raise ValueError(f"{location!r} entry {entry_id!r} does not match campaign {collection['campaign_id']!r}")
             sample_id = self._record_identifier(metadata, "sample_id", source.get("sample_id_path"))
             if sample_id is None:
-                raise ValueError(f"{source_name!r} entry {entry_id!r} has no sample ID")
-            records[source_name] = {"entry_id": entry_id, "item": item, "metadata": metadata, "sample_id": sample_id}
+                raise ValueError(f"{location!r} entry {entry_id!r} has no sample ID")
+            # Keep identifiers specific to the selector while sharing dataset reads.
+            records[key] = (record, sample_id)
+            coord_name = (f"{source_name}_entry_id" if input_name is None
+                          else f"{source_name}_{input_name}_entry_id")
+            if coord_name in provenance or coord_name in sources or coord_name == sample_dim:
+                raise ValueError(f"Provenance coordinate name collision: {coord_name!r}")
+            provenance[coord_name] = (sample_dim, [entry_id])
 
-        sample_ids = {record["sample_id"] for record in records.values()}
+        sample_ids = {sample_id for _, sample_id in records.values()}
         if len(sample_ids) != 1:
             raise ValueError("All supplied Tiled entries must have the same sample ID")
         sample_id = sample_ids.pop()
@@ -735,14 +859,22 @@ class DoubleAgentDriver(AgentWebAppMixin, Driver):
             if sample_id in set(map(str, self.input.coords[sample_dim].values)):
                 raise ValueError(f"Sample {sample_id!r} is already present in self.input")
 
+        for record, _ in records.values():
+            record["sample_id"] = sample_id
+        variables = {}
+        for name, source in sources.items():
+            if "inputs" in source:
+                variables[name] = self._constructed_collection_value(
+                    source, {input_name: records[(name, input_name)][0]
+                             for input_name in source["inputs"]}, sample_dim,
+                )
+            else:
+                variables[name] = self._collection_value(source, records[(name, None)][0], sample_dim)
         row = xr.Dataset(
-            {
-                name: self._collection_value(source, records[name], sample_dim)
-                for name, source in sources.items()
-            },
+            variables,
             coords={
                 **{sample_dim: [sample_id]},
-                **{f"{name}_entry_id": (sample_dim, [records[name]["entry_id"]]) for name in sources},
+                **provenance,
             },
         )
         self.input = self._materialize_input_dataset(
@@ -850,6 +982,8 @@ class DoubleAgentDriver(AgentWebAppMixin, Driver):
         
         return self.last_results
 
+
+_DEFAULT_PORT = 5050
 _OVERRIDE_MAIN_MODULE_NAME = 'DoubleAgentDriver'
 if __name__ == '__main__':
     from AFL.automation.shared.launcher import *

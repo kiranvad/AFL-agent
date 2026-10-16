@@ -5,7 +5,43 @@ Unit tests for AFL.double_agent preprocessor operations.
 import pytest
 import numpy as np
 import xarray as xr
-from AFL.double_agent.Preprocessor import SavgolFilter, SplinePreprocessor
+from AFL.double_agent.Preprocessor import SavgolFilter, SplinePreprocessor, UnitCubeTransform
+
+
+def test_unit_cube_transform_aligns_bounds_and_round_trips():
+    dataset = xr.Dataset(
+        {"parameters": (("component", "sample"), [[15.0, 20.0], [0.0, 2.0]])},
+        coords={"component": ["B", "A"], "sample": [4, 7]},
+    )
+    dataset.parameters.attrs["description"] = "Physical parameters"
+    bounds = {"A": {"min": -2.0, "max": 2.0}, "B": {"min": 10.0, "max": 20.0}}
+    forward = UnitCubeTransform(bounds, "parameters", "unit_parameters")
+    forward.calculate(dataset)
+    result = forward.output["unit_parameters"]
+    assert result.dims == dataset.parameters.dims
+    np.testing.assert_allclose(result, [[0.5, 1.0], [0.5, 1.0]])
+    assert result.attrs["description"] == "Physical parameters"
+    assert result.attrs["coordinate_space"] == "unit_cube"
+    inverse = UnitCubeTransform(bounds, "unit_parameters", "restored", inverse=True)
+    inverse.calculate(xr.Dataset({"unit_parameters": result}))
+    xr.testing.assert_equal(inverse.output["restored"], dataset.parameters)
+    assert inverse.output["restored"].attrs["coordinate_space"] == "physical"
+
+
+@pytest.mark.parametrize("bounds", [{}, {"A": {"min": 1.0, "max": 1.0}},
+                                   {"A": {"min": 0.0, "max": np.inf}}])
+def test_unit_cube_transform_rejects_invalid_bounds(bounds):
+    with pytest.raises(ValueError):
+        UnitCubeTransform(bounds, "parameters", "unit_parameters")
+
+
+def test_unit_cube_transform_requires_bounds_for_every_component():
+    dataset = xr.Dataset(
+        {"parameters": ("component", [1.0, 2.0])}, coords={"component": ["A", "B"]}
+    )
+    operation = UnitCubeTransform({"A": {"min": 0.0, "max": 2.0}}, "parameters", "unit")
+    with pytest.raises(ValueError, match="missing components"):
+        operation.calculate(dataset)
 
 
 def test_spline_preprocessor_defaults_and_batch_coordinates():
