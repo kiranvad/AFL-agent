@@ -1,10 +1,16 @@
-"""Peak scoring behavior and integration with serializable pipelines."""
+"""Peak preprocessing and scoring behavior."""
 
 import numpy as np
 import pytest
 import xarray as xr
 
-from AFL.double_agent import PeakFeatureScore, Pipeline, UnitCubeTransform
+from AFL.double_agent import (
+    PeakFeatureScore,
+    PeakFitPreprocessor,
+    Pipeline,
+    SavgolFilter,
+    SplinePreprocessor,
+)
 from AFL.double_agent.PipelineOp import PipelineOp
 
 
@@ -12,168 +18,160 @@ def gaussian(x, location, prominence, fwhm):
     return prominence * np.exp(-4.0 * np.log(2.0) * ((x - location) / fwhm) ** 2)
 
 
-def test_peak_matching_is_independent_of_target_order_and_preserves_samples():
-    x = np.linspace(-2.0, 2.0, 1001)
+def feature_dataset(rows):
+    values = np.asarray(rows, dtype=float)
+    return xr.Dataset(
+        {
+            "fitted_peak_location": (("sample", "detected_peak"), values[:, :, 0]),
+            "fitted_peak_prominence": (("sample", "detected_peak"), values[:, :, 1]),
+            "fitted_peak_fwhm": (("sample", "detected_peak"), values[:, :, 2]),
+        },
+        coords={"sample": np.arange(values.shape[0])},
+    )
+
+
+def test_score_accepts_peak_values_without_spectrum_preprocessing():
     targets = [
         {"location": 0.7, "prominence": 2.0, "fwhm": 0.25},
         {"location": -0.7, "prominence": 1.0, "fwhm": 0.35},
     ]
-    exact = sum(gaussian(x, **peak) for peak in targets)
-    shifted = sum(gaussian(x, **{**peak, "location": peak["location"] + 0.15})
-                  for peak in targets)
-    dataset = xr.Dataset(
-        {"current": (("sample", "potential"), np.stack([exact, shifted]))},
-        coords={"sample": [4, 7], "potential": x},
+    dataset = feature_dataset(
+        [
+            [[-0.7, 1.0, 0.35], [0.7, 2.0, 0.25], [np.nan] * 3],
+            [[-0.55, 1.0, 0.35], [np.nan] * 3, [np.nan] * 3],
+        ]
     )
-    operation = PeakFeatureScore(targets)
-    operation.calculate(dataset)
-    assert operation.output["score"][0] < 1e-3
+    operation = PeakFeatureScore(targets).calculate(dataset)
+    assert operation.output["score"][0] == pytest.approx(0)
     assert operation.output["score"][1] > operation.output["score"][0]
-    np.testing.assert_allclose(operation.output["peak_location"][0], [0.7, -0.7], atol=0.01)
-    np.testing.assert_allclose(operation.output["peak_prominence"][0], [2.0, 1.0], rtol=0.01)
-    np.testing.assert_allclose(operation.output["peak_fwhm"][0], [0.25, 0.35], rtol=0.01)
-    np.testing.assert_array_equal(operation.output["score"].sample, [4, 7])
+    np.testing.assert_allclose(operation.output["peak_location"][0], [0.7, -0.7])
 
 
-def test_missing_and_extra_peak_penalties_with_physical_axis_variable():
-    x = np.linspace(-2.0, 2.0, 501)
-    target = {"location": -0.7, "prominence": 1.0, "fwhm": 0.3}
-    operation = PeakFeatureScore([target], missing_peak_penalty=4.0, extra_peak_penalty=0.5)
-    dataset = xr.Dataset({"current": ("point", np.zeros(x.size)),
-                          "potential": ("point", x)})
-    operation.calculate(dataset)
-    np.testing.assert_allclose(operation.output["score"], [4.0])
-    assert np.isnan(operation.output["peak_location"]).all()
-    dataset["current"] = ("point", gaussian(x, **target) + gaussian(x, 0.7, 1.0, 0.3))
-    operation.calculate(dataset)
-    np.testing.assert_allclose(operation.output["score"], [0.5], atol=1e-3)
-
-
-def test_pipeline_operations_round_trip_and_run_together():
-    x = np.linspace(-1.0, 1.0, 201)
-    targets = [{"location": 0.0, "prominence": 1.0, "fwhm": 0.3}]
-    with Pipeline() as pipeline:
-        PeakFeatureScore(targets, output_variable="peak_loss")
-        UnitCubeTransform({"A": {"min": 10.0, "max": 20.0}}, "parameters", "unit")
-    restored = Pipeline(ops=[PipelineOp.from_json(op.to_json()) for op in pipeline.ops])
-    dataset = xr.Dataset(
-        {"current": (("sample", "potential"), gaussian(x, **targets[0])[None, :]),
-         "parameters": (("sample", "component"), [[15.0]])},
-        coords={"sample": [7], "potential": x, "component": ["A"]},
-    )
-    result = restored.calculate(dataset, disable_progress_bar=True)
-    assert restored.ops[0].name == "PeakFeatureScore"
-    assert result.peak_loss.item() < 1e-3
-    np.testing.assert_allclose(result.unit, [[0.5]])
-    assert {"peak_location", "peak_prominence", "peak_fwhm"}.issubset(result.data_vars)
-
-
-@pytest.mark.parametrize("potential,current,message", [
-    (np.linspace(1, 0, 21), np.zeros(21), "strictly increasing"),
-    (np.linspace(0, 1, 21), np.full(21, np.nan), "non-finite"),
-    (np.linspace(0, 1, 3), np.zeros(3), "not enough samples"),
-])
-def test_invalid_spectra_raise_clear_errors(potential, current, message):
-    operation = PeakFeatureScore([{"location": 0.5, "prominence": 1.0, "fwhm": 0.2}])
-    dataset = xr.Dataset({"current": ("potential", current)},
-                          coords={"potential": potential})
-    with pytest.raises(ValueError, match=message):
+def test_score_round_trips_and_rejects_partial_peak_rows():
+    target = [{"location": 0.0, "prominence": 1.0, "fwhm": 0.3}]
+    operation = PipelineOp.from_json(PeakFeatureScore(target).to_json())
+    assert operation.input_variable == [
+        "fitted_peak_location",
+        "fitted_peak_prominence",
+        "fitted_peak_fwhm",
+    ]
+    dataset = feature_dataset([[[0.0, 1.0, np.nan]]])
+    with pytest.raises(ValueError, match="all three"):
         operation.calculate(dataset)
 
 
-def test_per_sample_domains_and_different_curve_lengths_round_trip():
-    target = {"location": -0.5, "prominence": 1e-6, "fwhm": 0.1}
-    rows = []
-    for sample, size in (("SAM-1", 501), ("SAM-2", 301)):
-        x = np.linspace(-1.2, 0.2, size)
-        rows.append(xr.Dataset(
-            {"voltage": (("sample", "point"), x[None, :]),
-             "signal": (("sample", "point"), gaussian(x, **target)[None, :])},
-            coords={"sample": [sample], "point": np.arange(size)},
-        ))
-    dataset = xr.concat(rows, dim="sample", join="outer")
-    operation = PeakFeatureScore(
-        [target], domain_variable="voltage", codomain_variable="signal",
-        peak_distance=10, savgol_window=7,
+def test_separate_preprocessors_reproduce_peak_fit_pipeline():
+    pytest.importorskip("lmfit")
+    x = np.linspace(-1, 1, 401)
+    target = {"location": 0.05, "prominence": 1.0, "fwhm": 0.3}
+    y = gaussian(x, **target) + 0.01 * np.sin(170 * x)
+    dataset = xr.Dataset(
+        {"response": ("position", y, {"units": "counts"})},
+        coords={"position": ("position", x, {"units": "mm"})},
     )
-    restored = PipelineOp.from_json(operation.to_json())
-    assert restored.input_variable == ["voltage", "signal"]
-    result = Pipeline(ops=[restored]).calculate(dataset, disable_progress_bar=True)
-    np.testing.assert_array_equal(result.score.sample, ["SAM-1", "SAM-2"])
-    assert (result.score.values < 1e-3).all()
-    np.testing.assert_allclose(result.peak_location[:, 0], -0.5, atol=0.005)
-    np.testing.assert_allclose(result.peak_fwhm[:, 0], 0.1, rtol=0.02)
-    xr.testing.assert_equal(result.smoothened_voltage, dataset.voltage.rename("smoothened_voltage"))
-    assert result.smoothened_signal.dims == ("sample", "point")
-    assert np.isnan(result.smoothened_signal.sel(sample="SAM-2")[301:]).all()
-    for row in rows:
-        sample = row.sample.item()
-        expected = restored._smooth_curve(row.voltage.values[0], row.signal.values[0])
-        np.testing.assert_allclose(
-            result.smoothened_signal.sel(sample=sample)[:len(expected)], expected,
+    pipeline = Pipeline(
+        ops=[
+            SavgolFilter(
+                input_variable="response",
+                output_variable="filtered",
+                dim="position",
+                npts=401,
+                window_length=21,
+                polyorder=3,
+                apply_log_scale=False,
+            ),
+            SplinePreprocessor(
+                input_variable="filtered",
+                output_variable="spline",
+                dim="sg_position",
+                output_dim="spline_position",
+                n_points=401,
+            ),
+            PeakFitPreprocessor(
+                input_variable="response",
+                domain_variable="position",
+                feature_variable="spline",
+                feature_dim="spline_position",
+                peak_distance=25,
+            ),
+            PeakFeatureScore([target]),
+        ]
+    )
+    result = pipeline.calculate(dataset, disable_progress_bar=True)
+    assert result.fit_status.item() == "success"
+    assert result.score.item() < 0.02
+    assert abs(result.peak_location.item() - target["location"]) < 0.01
+    assert result.fitted_peak_location.attrs["units"] == "mm"
+    assert result.fitted_peak_prominence.attrs["units"] == "counts"
+    assert np.isfinite(result.fitted_curve).all()
+
+
+def test_existing_generic_preprocessors_and_peak_fit_support_batches():
+    pytest.importorskip("lmfit")
+    x = np.linspace(400, 800, 301)
+    target = {"location": 600, "prominence": 2, "fwhm": 40}
+    dataset = xr.Dataset(
+        {
+            "intensity": (
+                ("sample", "wavelength"),
+                np.stack([gaussian(x, **target), gaussian(x, 605, 2, 40)]),
+            )
+        },
+        coords={"sample": ["a", "b"], "wavelength": x},
+    )
+    pipeline = Pipeline(
+        ops=[
+            SavgolFilter(
+                input_variable="intensity",
+                output_variable="filtered",
+                dim="wavelength",
+                npts=301,
+                window_length=21,
+                polyorder=3,
+                apply_log_scale=False,
+            ),
+            SplinePreprocessor(
+                input_variable="filtered",
+                output_variable="spline",
+                dim="sg_wavelength",
+                output_dim="spline_wavelength",
+                sample_dim="sample",
+                n_points=301,
+            ),
+            PeakFitPreprocessor(
+                input_variable="intensity",
+                domain_variable="wavelength",
+                feature_variable="spline",
+                feature_dim="spline_wavelength",
+            ),
+            PeakFeatureScore([target]),
+        ]
+    )
+    result = pipeline.calculate(dataset, disable_progress_bar=True)
+    np.testing.assert_allclose(result.peak_location[:, 0], [600, 605], atol=0.2)
+
+
+@pytest.mark.parametrize("initial_center", [-0.1, 0.02])
+def test_fitted_center_stays_near_detected_guess(initial_center, monkeypatch):
+    pytest.importorskip("lmfit")
+    from lmfit.model import CompositeModel
+
+    x = np.linspace(-0.12, 0.5, 401)
+    operation = PeakFitPreprocessor(center_tolerance=0.05)
+    detected = np.array([[initial_center, 1.0, 0.1]])
+
+    def check_optimizer_bounds(model, data, params, **kwargs):
+        center = params["peak0_center"]
+        assert center.min == max(x[0], initial_center - 0.05)
+        assert center.max == min(x[-1], initial_center + 0.05)
+        raise RuntimeError("bounds verified")
+
+    monkeypatch.setattr(CompositeModel, "fit", check_optimizer_bounds)
+    with pytest.raises(RuntimeError, match="bounds verified"):
+        operation._fit_curve(
+            x,
+            gaussian(x, initial_center + 0.06, 1.0, 0.1),
+            detected,
+            np.array([initial_center - 0.05]),
+            np.array([initial_center + 0.05]),
         )
-
-
-def test_smoothed_outputs_preserve_shared_axis_units_and_input():
-    x = np.linspace(-1, 1, 201)
-    target = {"location": 0.0, "prominence": 1.0, "fwhm": 0.3}
-    y = gaussian(x, **target) + 0.02 * np.sin(250 * x)
-    dataset = xr.Dataset(
-        {"current": ("potential", y, {"units": "A"})},
-        coords={"potential": ("potential", x, {"units": "V"})},
-    )
-    original = dataset.copy(deep=True)
-    operation = PeakFeatureScore([target]).calculate(dataset)
-    axis = operation.output["smoothened_potential"]
-    smoothed = operation.output["smoothened_current"]
-    assert axis.dims == smoothed.dims == ("sample", "potential")
-    assert axis.attrs["units"] == "V"
-    assert smoothed.attrs["units"] == "A"
-    np.testing.assert_array_equal(axis.values[0], x)
-    np.testing.assert_allclose(smoothed.values[0], operation._smooth_curve(x, y))
-    assert np.std(smoothed.values[0] - gaussian(x, **target)) < np.std(y - gaussian(x, **target))
-    xr.testing.assert_identical(dataset, original)
-
-
-@pytest.mark.parametrize("location", [0, 10, -1])
-def test_per_sample_domain_rejects_unpaired_missing_values(location):
-    x = np.linspace(0, 1, 51)
-    y = np.zeros_like(x)
-    x[location] = np.nan
-    dataset = xr.Dataset({
-        "potential": (("sample", "point"), x[None, :]),
-        "current": (("sample", "point"), y[None, :]),
-    })
-    with pytest.raises(ValueError, match="non-finite"):
-        PeakFeatureScore(
-            [{"location": 0.5, "prominence": 1, "fwhm": 0.1}],
-            domain_variable="potential", codomain_variable="current",
-        ).calculate(dataset)
-
-
-def test_per_sample_domain_rejects_interior_paired_missing_values():
-    x = np.linspace(0, 1, 51)
-    y = np.zeros_like(x)
-    x[10] = y[10] = np.nan
-    dataset = xr.Dataset({"potential": ("point", x), "current": ("point", y)})
-    with pytest.raises(ValueError, match="non-finite"):
-        PeakFeatureScore(
-            [{"location": 0.5, "prominence": 1, "fwhm": 0.1}],
-        ).calculate(dataset)
-
-
-def test_shared_domain_broadcasts_with_custom_sample_dimension():
-    x = np.linspace(-1, 1, 201)
-    target = {"location": 0.0, "prominence": 1.0, "fwhm": 0.3}
-    dataset = xr.Dataset(
-        {"voltage": ("point", x),
-         "signal": (("point", "observation"),
-                    np.stack([gaussian(x, **target)] * 2, axis=1))},
-        coords={"observation": [4, 7]},
-    )
-    operation = PeakFeatureScore(
-        [target], domain_variable="voltage", codomain_variable="signal",
-        sample_dim="observation",
-    ).calculate(dataset)
-    np.testing.assert_array_equal(operation.output["score"].observation, [4, 7])
-    assert (operation.output["score"].values < 1e-3).all()

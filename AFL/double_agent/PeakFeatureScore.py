@@ -1,4 +1,4 @@
-"""Smooth spectra and score their peak features against requested targets."""
+"""Score precomputed peak features against requested targets."""
 
 from __future__ import annotations
 
@@ -6,9 +6,7 @@ from typing import Self
 
 import numpy as np
 import xarray as xr
-from scipy.interpolate import UnivariateSpline
 from scipy.optimize import linear_sum_assignment
-from scipy.signal import find_peaks, peak_widths, savgol_filter
 
 from AFL.double_agent.PipelineOp import PipelineOp
 
@@ -16,80 +14,38 @@ __all__ = ["PeakFeatureScore"]
 
 
 class PeakFeatureScore(PipelineOp):
-    """Smooth spectra, extract peak features, and score requested peaks.
+    """Score precomputed peak locations, prominences, and FWHMs.
 
-    Parameters
-    ----------
-    target_peaks
-        A list of dictionaries containing ``location``, ``prominence``, and
-        ``fwhm``.  Detected peaks are assigned one-to-one to requested peaks by
-        minimizing their normalized feature error, so target and detected peak
-        order do not need to agree.
-    output_variable, sample_dim
-        Scalar score output and observation dimension. A lower score is better.
-    domain_variable, codomain_variable
-        Names of the physical axis and spectrum variables. The domain can be
-        a shared 1D coordinate or a per-sample array, such as
-        ``potential(sample, point)`` paired with ``current(sample, point)``.
-        Each sample is scored on its own axis, without resampling. Paired
-        trailing NaNs from concatenating shorter curves are trimmed.
-    minimum_prominence
-        Absolute prominence floor, in the same units as the input current.
-        Detection also requires ``prominence_fraction`` times the smoothed
-        current range; the larger threshold is used.
-    weights
-        Optional weights for ``location``, ``prominence``, and ``fwhm``.
-    missing_peak_penalty, extra_peak_penalty
-        Additive penalties per unmatched requested or detected peak.
-
-    prominence_fraction, peak_distance
-        Relative prominence threshold and minimum spacing in samples.
-    savgol_window, savgol_order, spline_order, spline_strength, peak_weight
-        Settings for the reference Savitzky-Golay and peak-weighted spline
-        smoothing procedure, applied independently to each spectrum.
-
-    Notes
-    -----
-    Target prominence must use the input current units (e.g. amperes for the
-    sample datasets); location and FWHM use spectral coordinate units. No unit
-    conversion is performed. Smoothing preserves these units.
-
-    FWHM is measured at half prominence and converted from fractional array
-    indices to physical coordinates.  In addition to ``score``, the op emits
-    matched ``peak_location``, ``peak_prominence``, and ``peak_fwhm`` arrays
-    with dimensions ``(sample, target_peak)``.  Missing matches are NaN.
-    ``smoothened_<domain_variable>`` contains the physical axes used for
-    smoothing, and ``smoothened_<codomain_variable>`` contains the smoothed
-    spectra used for peak detection. Both retain the sample and curve
-    dimensions, units, and trailing NaN padding. Domain values are unchanged.
+    Peak detection, smoothing, and curve fitting live in separate preprocessing
+    operations. The three input variables must share ``sample_dim`` and
+    ``peak_dim``. A one-dimensional peak array is treated as a single sample.
+    Rows containing three NaNs represent padding or missing peaks.
     """
 
     def __init__(
         self,
         target_peaks: list[dict[str, float]],
-        domain_variable: str = "potential",
-        codomain_variable: str = "current",
+        peak_location_variable: str = "fitted_peak_location",
+        peak_prominence_variable: str = "fitted_peak_prominence",
+        peak_fwhm_variable: str = "fitted_peak_fwhm",
         output_variable: str = "score",
         sample_dim: str = "sample",
-        minimum_prominence: float = 0.0,
+        peak_dim: str = "detected_peak",
         weights: dict[str, float] | None = None,
         missing_peak_penalty: float = 3.0,
         extra_peak_penalty: float = 0.25,
-        prominence_fraction: float = 0.025,
-        peak_distance: int = 25,
-        savgol_window: int = 21,
-        savgol_order: int = 3,
-        spline_order: int = 3,
-        spline_strength: float = 0.25,
-        peak_weight: float = 5.0,
         name: str = "PeakFeatureScore",
     ) -> None:
-        for label, variable in (("domain_variable", domain_variable),
-                                ("codomain_variable", codomain_variable)):
-            if not isinstance(variable, str) or not variable:
-                raise ValueError(f"{label} must be a non-empty variable name")
+        variables = (
+            peak_location_variable,
+            peak_prominence_variable,
+            peak_fwhm_variable,
+        )
+        if any(not isinstance(variable, str) or not variable for variable in variables):
+            raise ValueError("peak feature variable names must be non-empty strings")
         if not target_peaks:
             raise ValueError("target_peaks must contain at least one peak")
+
         required = {"location", "prominence", "fwhm"}
         normalized_targets = []
         for index, peak in enumerate(target_peaks):
@@ -115,67 +71,75 @@ class PeakFeatureScore(PipelineOp):
             not np.isfinite(value) or value < 0 for value in normalized_weights.values()
         ):
             raise ValueError("weights must be finite and non-negative")
-        thresholds = (
-            minimum_prominence, prominence_fraction,
-            missing_peak_penalty, extra_peak_penalty,
-        )
-        if any(not np.isfinite(value) or value < 0 for value in thresholds):
-            raise ValueError("prominence thresholds and penalties must be finite and non-negative")
-        if not isinstance(peak_distance, int) or peak_distance < 1:
-            raise ValueError("peak_distance must be a positive integer")
-        if not isinstance(savgol_order, int) or savgol_order < 0:
-            raise ValueError("savgol_order must be a non-negative integer")
-        if not isinstance(savgol_window, int) or savgol_window <= savgol_order:
-            raise ValueError("savgol_window must be an integer greater than savgol_order")
-        if not isinstance(spline_order, int) or not 1 <= spline_order <= 5:
-            raise ValueError("spline_order must be an integer between 1 and 5")
-        if not np.isfinite(spline_strength) or spline_strength < 0:
-            raise ValueError("spline_strength must be finite and non-negative")
-        if not np.isfinite(peak_weight) or peak_weight < 1:
-            raise ValueError("peak_weight must be finite and at least one")
+        penalties = (missing_peak_penalty, extra_peak_penalty)
+        if any(not np.isfinite(value) or value < 0 for value in penalties):
+            raise ValueError("peak penalties must be finite and non-negative")
 
         super().__init__(
             name=name,
-            input_variable=[domain_variable, codomain_variable],
+            input_variable=list(variables),
             output_variable=output_variable,
         )
         self.target_peaks = normalized_targets
-        self.domain_variable = domain_variable
-        self.codomain_variable = codomain_variable
+        self.peak_location_variable = peak_location_variable
+        self.peak_prominence_variable = peak_prominence_variable
+        self.peak_fwhm_variable = peak_fwhm_variable
         self.sample_dim = sample_dim
-        self.minimum_prominence = float(minimum_prominence)
+        self.peak_dim = peak_dim
         self.weights = normalized_weights
         self.missing_peak_penalty = float(missing_peak_penalty)
         self.extra_peak_penalty = float(extra_peak_penalty)
-        self.prominence_fraction = float(prominence_fraction)
-        self.peak_distance = peak_distance
-        self.savgol_window = savgol_window
-        self.savgol_order = savgol_order
-        self.spline_order = spline_order
-        self.spline_strength = float(spline_strength)
-        self.peak_weight = float(peak_weight)
 
     def calculate(self, dataset: xr.Dataset) -> Self:
-        for variable in (self.domain_variable, self.codomain_variable):
-            if variable not in dataset:
-                raise ValueError(f"Dataset has no variable {variable!r}")
-        domain = dataset[self.domain_variable]
-        spectra = dataset[self.codomain_variable]
-        curve_dims = [dim for dim in spectra.dims if dim != self.sample_dim]
-        if len(curve_dims) != 1:
-            raise ValueError(f"{self.codomain_variable!r} must have exactly one curve dimension")
-        curve_dim = curve_dims[0]
-        if set(domain.dims) not in ({curve_dim}, {self.sample_dim, curve_dim}):
+        variables = (
+            self.peak_location_variable,
+            self.peak_prominence_variable,
+            self.peak_fwhm_variable,
+        )
+        missing = [variable for variable in variables if variable not in dataset]
+        if missing:
+            raise ValueError(f"Dataset has no peak feature variables {missing}")
+
+        arrays = []
+        for variable in variables:
+            values = dataset[variable]
+            if self.peak_dim not in values.dims:
+                raise ValueError(
+                    f"{variable!r} must have peak dimension {self.peak_dim!r}"
+                )
+            unexpected = set(values.dims).difference({self.sample_dim, self.peak_dim})
+            if unexpected:
+                raise ValueError(
+                    f"{variable!r} has unsupported dimensions {sorted(unexpected)}"
+                )
+            if self.sample_dim not in values.dims:
+                values = values.expand_dims({self.sample_dim: [0]})
+            arrays.append(values.transpose(self.sample_dim, self.peak_dim))
+
+        try:
+            arrays = list(xr.align(*arrays, join="exact"))
+        except ValueError as exc:
             raise ValueError(
-                f"{self.domain_variable!r} must use dimension {curve_dim!r} "
-                f"with an optional {self.sample_dim!r} dimension"
-            )
-        domain, spectra = xr.broadcast(domain, spectra)
-        if self.sample_dim not in spectra.dims:
-            domain = domain.expand_dims({self.sample_dim: [0]})
-            spectra = spectra.expand_dims({self.sample_dim: [0]})
-        domain = domain.transpose(self.sample_dim, curve_dim)
-        spectra = spectra.transpose(self.sample_dim, curve_dim)
+                "peak feature variables must have identical coordinates"
+            ) from exc
+
+        feature_values = np.stack(
+            [np.asarray(values.values, dtype=float) for values in arrays], axis=-1
+        )
+        partial = np.isnan(feature_values).any(axis=2) & ~np.isnan(feature_values).all(
+            axis=2
+        )
+        if partial.any():
+            raise ValueError("each peak must provide all three features or three NaNs")
+        invalid = ~np.isfinite(feature_values) & ~np.isnan(feature_values)
+        if invalid.any():
+            raise ValueError("peak features must be finite or NaN padding")
+        finite_rows = np.isfinite(feature_values).all(axis=2)
+        invalid_shapes = finite_rows & (
+            (feature_values[:, :, 1] <= 0) | (feature_values[:, :, 2] <= 0)
+        )
+        if invalid_shapes.any():
+            raise ValueError("peak prominence and fwhm values must be positive")
 
         target = np.array(
             [
@@ -194,52 +158,12 @@ class PeakFeatureScore(PipelineOp):
         weight = np.array(
             [self.weights["location"], self.weights["prominence"], self.weights["fwhm"]]
         )
-        scores = np.empty(spectra.sizes[self.sample_dim], dtype=float)
-        matched = np.full((len(scores), len(target), 3), np.nan, dtype=float)
-        smoothed_values = np.full(spectra.shape, np.nan, dtype=float)
+        scores = np.empty(feature_values.shape[0], dtype=float)
+        matched = np.full((feature_values.shape[0], len(target), 3), np.nan)
 
-        for sample_index, (x, y) in enumerate(zip(
-            np.asarray(domain.values, dtype=float),
-            np.asarray(spectra.values, dtype=float),
-        )):
-            # xr.concat pads shorter curves with paired NaNs on the point axis.
-            # Trim only trailing padding; invalid measured points still fail.
-            paired_nan = np.isnan(x) & np.isnan(y)
-            end = len(x)
-            while end and paired_nan[end - 1]:
-                end -= 1
-            x, y = x[:end], y[:end]
-            if not np.isfinite(x).all() or not np.isfinite(y).all():
-                raise ValueError(
-                    f"spectrum at sample {sample_index} contains non-finite values"
-                )
-            if x.size < 3:
-                raise ValueError("spectral coordinates must be a finite 1D array of length >= 3")
-            if not np.all(np.diff(x) > 0):
-                raise ValueError("spectral coordinates must be strictly increasing")
-            y = self._smooth_curve(x, y)
-            smoothed_values[sample_index, :end] = y
-            indices, properties = find_peaks(
-                y,
-                prominence=max(self.minimum_prominence, self.prominence_fraction * np.ptp(y)),
-                distance=self.peak_distance,
-            )
-            if len(indices):
-                widths = peak_widths(
-                    y,
-                    indices,
-                    rel_height=0.5,
-                    prominence_data=(
-                        properties["prominences"],
-                        properties["left_bases"],
-                        properties["right_bases"],
-                    ),
-                )
-                left = np.interp(widths[2], np.arange(x.size), x)
-                right = np.interp(widths[3], np.arange(x.size), x)
-                detected = np.column_stack(
-                    [x[indices], properties["prominences"], right - left]
-                )
+        for sample_index, sample_features in enumerate(feature_values):
+            detected = sample_features[finite_rows[sample_index]]
+            if len(detected):
                 cost = np.sum(
                     weight
                     * ((target[:, None, :] - detected[None, :, :]) / scale[:, None, :])
@@ -251,9 +175,7 @@ class PeakFeatureScore(PipelineOp):
                 feature_error = float(cost[target_indices, detected_indices].sum())
             else:
                 target_indices = np.array([], dtype=int)
-                detected = np.empty((0, 3))
                 feature_error = 0.0
-
             scores[sample_index] = (
                 feature_error / len(target)
                 + self.missing_peak_penalty * (len(target) - len(target_indices))
@@ -261,16 +183,14 @@ class PeakFeatureScore(PipelineOp):
             )
 
         coords = {
-            self.sample_dim: spectra[self.sample_dim],
+            self.sample_dim: arrays[0][self.sample_dim],
             "target_peak": np.arange(len(target)),
         }
         self.output = {
-            f"smoothened_{self.domain_variable}": domain.copy(deep=True),
-            f"smoothened_{self.codomain_variable}": spectra.copy(data=smoothed_values),
             self.output_variable: xr.DataArray(
                 scores,
                 dims=(self.sample_dim,),
-                coords={self.sample_dim: spectra[self.sample_dim]},
+                coords={self.sample_dim: arrays[0][self.sample_dim]},
                 attrs={"description": "Peak matching loss; lower is better."},
             ),
             "peak_location": xr.DataArray(
@@ -283,86 +203,11 @@ class PeakFeatureScore(PipelineOp):
                 matched[:, :, 2], dims=(self.sample_dim, "target_peak"), coords=coords
             ),
         }
+        for output_name, source in (
+            ("peak_location", arrays[0]),
+            ("peak_prominence", arrays[1]),
+            ("peak_fwhm", arrays[2]),
+        ):
+            if units := source.attrs.get("units"):
+                self.output[output_name].attrs["units"] = units
         return self
-
-    def _smooth_curve(
-        self, potential: np.ndarray, current: np.ndarray
-    ) -> np.ndarray:
-        """Smooth current data with Savitzky-Golay filtering, then a spline.
-
-        ``potential`` and ``current`` must be finite one-dimensional arrays of the
-        same length, and potential must be strictly increasing. Current units are
-        preserved in the returned array.
-        """
-        savgol_window = self.savgol_window
-        savgol_order = self.savgol_order
-        spline_order = self.spline_order
-        spline_strength = self.spline_strength
-        peak_weight = self.peak_weight
-
-        potential = np.asarray(potential, dtype=float)
-        current = np.asarray(current, dtype=float)
-
-        if potential.ndim != 1 or current.ndim != 1:
-            raise ValueError("potential and current must be one-dimensional")
-        if potential.size != current.size:
-            raise ValueError("potential and current must have the same length")
-        if potential.size <= max(savgol_order, spline_order):
-            raise ValueError("not enough samples for the requested filter orders")
-        if not np.all(np.isfinite(potential)) or not np.all(np.isfinite(current)):
-            raise ValueError("potential and current must contain only finite values")
-        if not np.all(np.diff(potential) > 0):
-            raise ValueError("potential must be strictly increasing")
-        if savgol_window <= savgol_order:
-            raise ValueError("savgol_window must be greater than savgol_order")
-        if spline_strength < 0:
-            raise ValueError("spline_strength must be non-negative")
-        if peak_weight < 1:
-            raise ValueError("peak_weight must be at least one")
-
-        # Savitzky-Golay requires an odd window no longer than the input. Reduce
-        # the requested window for short curves while retaining an odd length.
-        maximum_window = potential.size if potential.size % 2 else potential.size - 1
-        window = min(savgol_window, maximum_window)
-        if window % 2 == 0:
-            window -= 1
-        if window <= savgol_order:
-            raise ValueError("not enough samples for the Savitzky-Golay window")
-
-        savgol_current = savgol_filter(
-            current, window_length=window, polyorder=savgol_order
-        )
-
-        # The raw-minus-filtered residual isolates high-frequency measurement
-        # noise more reliably than differences in the filtered signal. Its robust
-        # standard deviation sets a unit-independent spline penalty. Increase
-        # spline_strength for an even smoother result or use zero to interpolate
-        # the Savitzky-Golay output exactly.
-        residual = current - savgol_current
-        centered_residual = residual - np.median(residual)
-        noise_sigma = np.median(np.abs(centered_residual)) / 0.6745
-        smoothing_factor = current.size * noise_sigma**2 * spline_strength
-
-        # Give broad, significant Savitzky-Golay peaks more influence on the
-        # spline. This permits strong baseline smoothing without flattening a
-        # narrow analytical peak or chasing its single highest noisy sample.
-        weights = np.ones(current.size)
-        candidate_peaks, _ = find_peaks(
-            savgol_current,
-            prominence=0.05 * np.ptp(savgol_current),
-            distance=window,
-        )
-        peak_radius = max(2, window // 3)
-        for peak in candidate_peaks:
-            left = max(0, peak - peak_radius)
-            right = min(current.size, peak + peak_radius + 1)
-            weights[left:right] = peak_weight
-
-        spline = UnivariateSpline(
-            potential,
-            savgol_current,
-            k=spline_order,
-            s=smoothing_factor,
-            w=weights,
-        )
-        return spline(potential)

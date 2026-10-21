@@ -19,11 +19,61 @@ import numpy as np
 import sympy
 import xarray as xr
 from scipy.interpolate import UnivariateSpline
-from scipy.signal import savgol_filter  # type: ignore
+from scipy.signal import find_peaks, peak_widths, savgol_filter  # type: ignore
 from typing_extensions import Self
 
 from AFL.double_agent.PipelineOp import PipelineOp
 from AFL.double_agent.util import listify
+
+
+def _curve_data(
+    dataset: xr.Dataset,
+    domain_variable: str,
+    signal_variable: str,
+    sample_dim: str,
+) -> tuple[xr.DataArray, xr.DataArray, str]:
+    """Broadcast a curve axis and signal to ``(sample, point)`` form."""
+    for variable in (domain_variable, signal_variable):
+        if variable not in dataset:
+            raise ValueError(f"Dataset has no variable {variable!r}")
+    domain = dataset[domain_variable]
+    signal = dataset[signal_variable]
+    curve_dims = [dim for dim in signal.dims if dim != sample_dim]
+    if len(curve_dims) != 1:
+        raise ValueError(f"{signal_variable!r} must have exactly one curve dimension")
+    curve_dim = curve_dims[0]
+    if set(domain.dims) not in ({curve_dim}, {sample_dim, curve_dim}):
+        raise ValueError(
+            f"{domain_variable!r} must use dimension {curve_dim!r} "
+            f"with an optional {sample_dim!r} dimension"
+        )
+    domain, signal = xr.broadcast(domain, signal)
+    if sample_dim not in signal.dims:
+        domain = domain.expand_dims({sample_dim: [0]})
+        signal = signal.expand_dims({sample_dim: [0]})
+    return (
+        domain.transpose(sample_dim, curve_dim),
+        signal.transpose(sample_dim, curve_dim),
+        curve_dim,
+    )
+
+
+def _trim_curve(x: np.ndarray, *signals: np.ndarray) -> tuple[int, list[np.ndarray]]:
+    """Trim trailing concat padding and validate one sample's curve data."""
+    paired_nan = np.isnan(x)
+    for signal in signals:
+        paired_nan &= np.isnan(signal)
+    end = len(x)
+    while end and paired_nan[end - 1]:
+        end -= 1
+    values = [np.asarray(value[:end], dtype=float) for value in (x, *signals)]
+    if not all(np.isfinite(value).all() for value in values):
+        raise ValueError("curve contains non-finite values")
+    if end < 3:
+        raise ValueError("curve coordinates must have at least three values")
+    if not np.all(np.diff(values[0]) > 0):
+        raise ValueError("curve coordinates must be strictly increasing")
+    return end, values
 
 class Preprocessor(PipelineOp):
     """Base class stub for all preprocessors
@@ -49,6 +99,450 @@ class Preprocessor(PipelineOp):
     def calculate(self, dataset: xr.Dataset) -> Self:
         """Apply this `PipelineOp` to the supplied `xarray.dataset`"""
         return NotImplementedError(".calculate must be implemented in subclasses")  # type: ignore
+
+
+class PeakSmoothingPreprocessor(Preprocessor):
+    """Apply the peak-preserving smoothing used by the original score op.
+
+    Each sample is processed on its native domain. A Savitzky-Golay pass first
+    estimates the high-frequency residual. Its robust standard deviation sets
+    a sample-specific spline penalty, while neighborhoods around significant
+    peaks receive extra weight so the spline does not flatten them.
+    """
+
+    def __init__(
+        self,
+        input_variable: str = "signal",
+        domain_variable: str = "x",
+        output_variable: str = "smoothened_signal",
+        sample_dim: str = "sample",
+        savgol_window: int = 21,
+        savgol_order: int = 3,
+        spline_order: int = 3,
+        spline_strength: float = 0.25,
+        peak_weight: float = 5.0,
+        candidate_prominence_fraction: float = 0.05,
+        name: str = "PeakSmoothingPreprocessor",
+    ) -> None:
+        if not isinstance(savgol_order, int) or savgol_order < 0:
+            raise ValueError("savgol_order must be a non-negative integer")
+        if not isinstance(savgol_window, int) or savgol_window <= savgol_order:
+            raise ValueError("savgol_window must be greater than savgol_order")
+        if not isinstance(spline_order, int) or not 1 <= spline_order <= 5:
+            raise ValueError("spline_order must be between one and five")
+        if not np.isfinite(spline_strength) or spline_strength < 0:
+            raise ValueError("spline_strength must be finite and non-negative")
+        if not np.isfinite(peak_weight) or peak_weight < 1:
+            raise ValueError("peak_weight must be finite and at least one")
+        if (
+            not np.isfinite(candidate_prominence_fraction)
+            or candidate_prominence_fraction < 0
+        ):
+            raise ValueError(
+                "candidate_prominence_fraction must be finite and non-negative"
+            )
+        super().__init__(
+            name=name,
+            input_variable=[domain_variable, input_variable],
+            output_variable=output_variable,
+        )
+        self.domain_variable = domain_variable
+        self.signal_variable = input_variable
+        self.sample_dim = sample_dim
+        self.savgol_window = savgol_window
+        self.savgol_order = savgol_order
+        self.spline_order = spline_order
+        self.spline_strength = float(spline_strength)
+        self.peak_weight = float(peak_weight)
+        self.candidate_prominence_fraction = float(candidate_prominence_fraction)
+
+    def calculate(self, dataset: xr.Dataset) -> Self:
+        domain, signal, _ = _curve_data(
+            dataset, self.domain_variable, self.signal_variable, self.sample_dim
+        )
+        smoothed_values = np.full(signal.shape, np.nan, dtype=float)
+        for sample_index, (x, y) in enumerate(zip(domain.values, signal.values)):
+            end, (x, y) = _trim_curve(x, y)
+            if end <= max(self.savgol_order, self.spline_order):
+                raise ValueError("not enough samples for the requested filter orders")
+            maximum_window = end if end % 2 else end - 1
+            window = min(self.savgol_window, maximum_window)
+            if window % 2 == 0:
+                window -= 1
+            if window <= self.savgol_order:
+                raise ValueError("not enough samples for the Savitzky-Golay window")
+
+            savgol_signal = savgol_filter(
+                y, window_length=window, polyorder=self.savgol_order
+            )
+            residual = y - savgol_signal
+            centered_residual = residual - np.median(residual)
+            noise_sigma = np.median(np.abs(centered_residual)) / 0.6745
+            smoothing_factor = (
+                end * noise_sigma**2 * self.spline_strength
+            )
+
+            weights = np.ones(end)
+            candidate_peaks, _ = find_peaks(
+                savgol_signal,
+                prominence=self.candidate_prominence_fraction * np.ptp(savgol_signal),
+                distance=window,
+            )
+            peak_radius = max(2, window // 3)
+            for peak in candidate_peaks:
+                left = max(0, peak - peak_radius)
+                right = min(end, peak + peak_radius + 1)
+                weights[left:right] = self.peak_weight
+
+            spline = UnivariateSpline(
+                x,
+                savgol_signal,
+                k=self.spline_order,
+                s=smoothing_factor,
+                w=weights,
+            )
+            smoothed_values[sample_index, :end] = spline(x)
+
+        output = signal.copy(data=smoothed_values)
+        output.attrs = dict(signal.attrs)
+        output.attrs["description"] = (
+            "Peak-preserving Savitzky-Golay and adaptive spline smoothing"
+        )
+        self.output = {self.output_variable: output}
+        return self
+
+
+class PeakFitPreprocessor(Preprocessor):
+    """Detect spline peaks and fit them with lmfit pseudo-Voigt components.
+
+    ``feature_variable`` supplies the smoothed curve used for initial peak
+    locations, prominences, and widths. ``input_variable`` supplies the curve
+    fitted by lmfit and may be either the original signal or another processed
+    curve. Set ``feature_domain_variable`` when feature coordinates vary by
+    sample. By default, fitted centers are bounded by midpoints between adjacent
+    detected peaks; ``center_tolerance`` replaces those bounds with a fixed
+    tolerance around each detected center.
+    """
+
+    def __init__(
+        self,
+        input_variable: str = "signal",
+        domain_variable: str = "x",
+        feature_variable: str = "spline_signal",
+        feature_dim: str = "spline_x",
+        feature_domain_variable: str | None = None,
+        output_prefix: str = "fitted_peak",
+        sample_dim: str = "sample",
+        peak_dim: str = "detected_peak",
+        minimum_prominence: float = 0.0,
+        prominence_fraction: float = 0.025,
+        peak_distance: int = 25,
+        center_tolerance: float | None = None,
+        name: str = "PeakFitPreprocessor",
+    ) -> None:
+        if any(
+            not np.isfinite(value) or value < 0
+            for value in (minimum_prominence, prominence_fraction)
+        ):
+            raise ValueError("prominence thresholds must be finite and non-negative")
+        if not isinstance(peak_distance, int) or peak_distance < 1:
+            raise ValueError("peak_distance must be a positive integer")
+        if center_tolerance is not None and (
+            not np.isfinite(center_tolerance) or center_tolerance <= 0
+        ):
+            raise ValueError("center_tolerance must be finite and positive or None")
+        outputs = [
+            f"{output_prefix}_{label}"
+            for label in ("location", "prominence", "fwhm")
+        ]
+        inputs = [domain_variable, input_variable, feature_variable]
+        if feature_domain_variable is not None and feature_domain_variable not in inputs:
+            inputs.append(feature_domain_variable)
+        super().__init__(
+            name=name,
+            input_variable=inputs,
+            output_variable=outputs,
+        )
+        self.domain_variable = domain_variable
+        self.feature_variable = feature_variable
+        self.feature_dim = feature_dim
+        self.feature_domain_variable = feature_domain_variable
+        self.output_prefix = output_prefix
+        self.sample_dim = sample_dim
+        self.peak_dim = peak_dim
+        self.minimum_prominence = float(minimum_prominence)
+        self.prominence_fraction = float(prominence_fraction)
+        self.peak_distance = peak_distance
+        self.center_tolerance = (
+            None if center_tolerance is None else float(center_tolerance)
+        )
+
+    def calculate(self, dataset: xr.Dataset) -> Self:
+        domain, signal, _ = _curve_data(
+            dataset, self.domain_variable, self.input_variable, self.sample_dim
+        )
+        if self.feature_variable not in dataset:
+            raise ValueError(f"Dataset has no variable {self.feature_variable!r}")
+        if self.feature_domain_variable is None:
+            feature_curves = dataset[self.feature_variable]
+            if self.feature_dim not in feature_curves.dims:
+                raise ValueError(
+                    f"{self.feature_variable!r} must have dimension {self.feature_dim!r}"
+                )
+            unexpected = set(feature_curves.dims).difference(
+                {self.sample_dim, self.feature_dim}
+            )
+            if unexpected:
+                raise ValueError(
+                    f"{self.feature_variable!r} has unsupported dimensions "
+                    f"{sorted(unexpected)}"
+                )
+            if self.sample_dim not in feature_curves.dims:
+                feature_curves = feature_curves.expand_dims({self.sample_dim: [0]})
+            feature_curves = feature_curves.transpose(self.sample_dim, self.feature_dim)
+            shared_feature_x = np.asarray(
+                feature_curves[self.feature_dim].values, dtype=float
+            )
+            if (
+                shared_feature_x.ndim != 1
+                or shared_feature_x.size < 3
+                or not np.isfinite(shared_feature_x).all()
+                or not np.all(np.diff(shared_feature_x) > 0)
+            ):
+                raise ValueError(
+                    "feature coordinates must be finite and strictly increasing"
+                )
+            feature_domain = None
+        else:
+            feature_domain, feature_curves, _ = _curve_data(
+                dataset,
+                self.feature_domain_variable,
+                self.feature_variable,
+                self.sample_dim,
+            )
+            shared_feature_x = None
+        if not np.array_equal(
+            signal[self.sample_dim].values, feature_curves[self.sample_dim].values
+        ):
+            raise ValueError("fit and feature curves must have identical sample coordinates")
+
+        detected_rows = []
+        for sample_index, feature_y in enumerate(feature_curves.values):
+            if feature_domain is None:
+                feature_x = shared_feature_x
+                feature_y = np.asarray(feature_y, dtype=float)
+                if not np.isfinite(feature_y).all():
+                    raise ValueError(
+                        f"feature curve at sample {sample_index} contains non-finite values"
+                    )
+            else:
+                _, (feature_x, feature_y) = _trim_curve(
+                    feature_domain.values[sample_index], feature_y
+                )
+            indices, properties = find_peaks(
+                feature_y,
+                prominence=max(
+                    self.minimum_prominence,
+                    self.prominence_fraction * np.ptp(feature_y),
+                ),
+                distance=self.peak_distance,
+            )
+            if not len(indices):
+                detected_rows.append(np.empty((0, 5)))
+                continue
+            widths = peak_widths(
+                feature_y,
+                indices,
+                rel_height=0.5,
+                prominence_data=(
+                    properties["prominences"],
+                    properties["left_bases"],
+                    properties["right_bases"],
+                ),
+            )
+            left = np.interp(widths[2], np.arange(feature_x.size), feature_x)
+            right = np.interp(widths[3], np.arange(feature_x.size), feature_x)
+            detected_rows.append(
+                np.column_stack(
+                    [
+                        feature_x[indices],
+                        properties["prominences"],
+                        right - left,
+                        left,
+                        right,
+                    ]
+                )
+            )
+
+        peak_count = max((len(row) for row in detected_rows), default=0)
+        fitted_features = np.full((len(detected_rows), peak_count, 3), np.nan)
+        fitted_parameters = np.full_like(fitted_features, np.nan)
+        fitted_values = np.full(signal.shape, np.nan)
+        background_values = np.full(signal.shape, np.nan)
+        fit_status = np.full(signal.sizes[self.sample_dim], "no_peaks", dtype="U8")
+        fit_rmse = np.full(signal.sizes[self.sample_dim], np.nan)
+
+        for sample_index, (x, y, detected_row) in enumerate(
+            zip(domain.values, signal.values, detected_rows)
+        ):
+            end, (x, y) = _trim_curve(x, y)
+            detected = detected_row[:, :3]
+            left = detected_row[:, 3]
+            right = detected_row[:, 4]
+            try:
+                result_features, parameters, fitted, background = self._fit_curve(
+                    x, y, detected, left, right
+                )
+            except (ValueError, RuntimeError, ArithmeticError) as exc:
+                sample = signal[self.sample_dim].values[sample_index]
+                raise RuntimeError(f"lmfit fitting failed for sample {sample!r}: {exc}") from exc
+            fitted_features[sample_index, :len(detected)] = result_features
+            fitted_parameters[sample_index, :len(detected)] = parameters
+            fitted_values[sample_index, :end] = fitted
+            background_values[sample_index, :end] = background
+            fit_rmse[sample_index] = np.sqrt(np.mean((y - fitted) ** 2))
+            if len(detected):
+                fit_status[sample_index] = "success"
+
+        coords = {
+            self.sample_dim: signal[self.sample_dim],
+            self.peak_dim: np.arange(peak_count),
+        }
+        self.output = {}
+        for index, label in enumerate(("location", "prominence", "fwhm")):
+            self.output[f"{self.output_prefix}_{label}"] = xr.DataArray(
+                fitted_features[:, :, index],
+                dims=(self.sample_dim, self.peak_dim),
+                coords=coords,
+            )
+        for index, label in enumerate(("amplitude", "sigma", "fraction")):
+            self.output[f"{self.output_prefix}_{label}"] = xr.DataArray(
+                fitted_parameters[:, :, index],
+                dims=(self.sample_dim, self.peak_dim),
+                coords=coords,
+            )
+        self.output["fitted_curve"] = signal.copy(data=fitted_values)
+        self.output["fitted_background"] = signal.copy(data=background_values)
+        self.output["fit_status"] = xr.DataArray(
+            fit_status,
+            dims=(self.sample_dim,),
+            coords={self.sample_dim: signal[self.sample_dim]},
+        )
+        self.output["fit_rmse"] = xr.DataArray(
+            fit_rmse,
+            dims=(self.sample_dim,),
+            coords={self.sample_dim: signal[self.sample_dim]},
+        )
+        feature_domain_units = (
+            feature_curves[self.feature_dim].attrs.get("units")
+            if feature_domain is None
+            else feature_domain.attrs.get("units")
+        )
+        domain_units = domain.attrs.get("units") or feature_domain_units
+        signal_units = signal.attrs.get("units") or feature_curves.attrs.get("units")
+        for label in ("location", "fwhm", "sigma"):
+            if domain_units:
+                self.output[f"{self.output_prefix}_{label}"].attrs["units"] = domain_units
+        if signal_units:
+            self.output[f"{self.output_prefix}_prominence"].attrs["units"] = signal_units
+            self.output["fit_rmse"].attrs["units"] = signal_units
+        if signal_units and domain_units:
+            self.output[f"{self.output_prefix}_amplitude"].attrs["units"] = (
+                f"{signal_units} * {domain_units}"
+            )
+        self.output[f"{self.output_prefix}_fraction"].attrs["units"] = "1"
+        return self
+
+    def _fit_curve(self, x, y, detected, left, right):
+        """Jointly fit positive peaks and a shifted exponential/linear background."""
+        from lmfit.models import ExponentialModel, LinearModel, PseudoVoigtModel
+
+        if not len(detected) or np.ptp(y) == 0:
+            return detected.copy(), np.full((len(detected), 3), np.nan), y.copy(), y.copy()
+        signal_scale = np.max(np.abs(y))
+        scaled_y = y / signal_scale
+        span = x[-1] - x[0]
+        origin = x[0]
+
+        class ShiftedExponentialModel(ExponentialModel):
+            def eval(self, params=None, **kwargs):
+                kwargs["x"] = (np.asarray(kwargs["x"]) - origin) / span
+                return super().eval(params=params, **kwargs)
+
+        exponential = ShiftedExponentialModel(prefix="exponential_")
+        linear = LinearModel(prefix="linear_")
+        model = exponential + linear
+        params = model.make_params()
+        mask = np.ones(x.size, dtype=bool)
+        for lower, upper in zip(left, right):
+            mask &= ~((x >= lower) & (x <= upper))
+        if mask.sum() < 2:
+            mask[:] = True
+        slope, intercept = np.polyfit(x[mask] - origin, scaled_y[mask], 1)
+        params["linear_slope"].set(value=slope)
+        params["linear_intercept"].set(value=intercept - slope * origin)
+        params["exponential_amplitude"].set(value=0)
+        params["exponential_decay"].set(value=0.2, min=0.01, max=100)
+        minimum_sigma = 0.5 * np.min(np.diff(x))
+        maximum_sigma = span / 2
+        centers = detected[:, 0]
+        midpoints = (centers[:-1] + centers[1:]) / 2
+        for index, (center, height, width) in enumerate(detected):
+            prefix = f"peak{index}_"
+            peak = PseudoVoigtModel(prefix=prefix)
+            peak_params = peak.make_params()
+            sigma = np.clip(width / 2, minimum_sigma, maximum_sigma)
+            height_per_area = (
+                0.5 * np.sqrt(np.log(2) / np.pi) + 0.5 / np.pi
+            ) / sigma
+            peak_params[prefix + "center"].set(
+                value=center,
+                min=(
+                    (x[0] if index == 0 else midpoints[index - 1])
+                    if self.center_tolerance is None
+                    else max(x[0], center - self.center_tolerance)
+                ),
+                max=(
+                    (x[-1] if index == len(detected) - 1 else midpoints[index])
+                    if self.center_tolerance is None
+                    else min(x[-1], center + self.center_tolerance)
+                ),
+            )
+            peak_params[prefix + "sigma"].set(
+                value=sigma, min=minimum_sigma, max=maximum_sigma
+            )
+            peak_params[prefix + "amplitude"].set(
+                value=height / signal_scale / height_per_area, min=0
+            )
+            peak_params[prefix + "fraction"].set(value=0.5, min=0, max=1)
+            params.update(peak_params)
+            model = model + peak
+        result = model.fit(
+            scaled_y, params=params, x=x, method="least_squares", max_nfev=5000
+        )
+        if not result.success:
+            raise RuntimeError(f"lmfit failed: {result.message}")
+        fitted = result.eval(x=x) * signal_scale
+        components = result.eval_components(x=x)
+        background = (components["exponential_"] + components["linear_"]) * signal_scale
+        fitted_features = np.empty((len(detected), 3))
+        parameters = np.empty_like(fitted_features)
+        for index in range(len(detected)):
+            prefix = f"peak{index}_"
+            fitted_features[index] = (
+                result.params[prefix + "center"].value,
+                result.params[prefix + "height"].value * signal_scale,
+                result.params[prefix + "fwhm"].value,
+            )
+            parameters[index] = (
+                result.params[prefix + "amplitude"].value * signal_scale,
+                result.params[prefix + "sigma"].value,
+                result.params[prefix + "fraction"].value,
+            )
+        arrays = (fitted, background, fitted_features, parameters)
+        if not all(np.isfinite(values).all() for values in arrays):
+            raise ValueError("lmfit produced non-finite fit results")
+        return fitted_features, parameters, fitted, background
 
 
 class UnitCubeTransform(Preprocessor):
