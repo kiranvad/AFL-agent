@@ -5,6 +5,7 @@ from .PyTorchExtrapolator import *
 from .PairMetric import *
 from .Labeler import *
 from .Preprocessor import *
+from .PeakFeatureScore import *
 from .Generator import *
 from .plotting import *
 from .Boundary import *

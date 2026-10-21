@@ -35,6 +35,7 @@ dependencies = [
     "netcdf4",
     "pandas",
     "scipy",
+    "lmfit",
     "matplotlib",
     "plotly",
     "kaleido",
