@@ -443,3 +443,184 @@ def test_append_dataset_rejects_wrong_campaign():
 
     with pytest.raises(ValueError, match="does not match campaign"):
         driver.append_dataset({"composition": "prepare", "avg_rgb": "rgb"})
+
+
+def _parameter_spec():
+    return {
+        "campaign_id": "asv-check-b71d1f7e",
+        "sample_dim": "sample",
+        "sources": {
+            "parameters": {
+                "inputs": {
+                    name: {
+                        "driver_name": "GamryProxyDriver",
+                        "task_name": task,
+                        "campaign_id_path": "attrs.AL_campaign_name",
+                        "sample_id_path": "attrs.sample_uuid",
+                        "source": "metadata",
+                    }
+                    for name, task in [("swv", "runSWV"), ("ca", "runCA")]
+                },
+                # Deliberately differs from coordinate order.
+                "mapping": {
+                    "step2_time": {"input": "ca", "path": "attrs.parameters.step2_time"},
+                    "frequency": {"input": "swv", "path": "attrs.parameters.frequency"},
+                    "step_size": {"input": "swv", "path": "attrs.parameters.step_size"},
+                    "pulse_size": {"input": "swv", "path": "attrs.parameters.pulse_size"},
+                },
+                "mapping_to_vector": True,
+                "dims": ["parameter"],
+                "coords": {"parameter": ["pulse_size", "step_size", "frequency", "step2_time"]},
+            }
+        },
+    }
+
+
+def _parameter_items(sample_id="SAM-a8be42da-5cbf-4369-ab0b-6428c0f89847"):
+    return {
+        name: SimpleNamespace(metadata={"attrs": {
+            "driver_name": "GamryProxyDriver", "task_name": task,
+            "AL_campaign_name": "asv-check-b71d1f7e", "sample_uuid": sample_id,
+            "parameters": parameters,
+        }})
+        for name, task, parameters in [
+            ("swv", "runSWV", {"pulse_size": 0.025, "step_size": 0.002, "frequency": 25.0}),
+            ("ca", "runCA", {"step2_time": 60.0}),
+        ]
+    }
+
+
+def test_constructed_parameters_order_provenance_and_append():
+    items = _parameter_items()
+    items.update({f"{name}2": item for name, item in _parameter_items("SAM-002").items()})
+    driver = _collection_driver(items)
+    driver.setup_data_collection(_parameter_spec())
+    driver.append_dataset({"parameters": {"swv": "swv", "ca": "ca"}})
+    result = driver.append_dataset({"parameters": {"swv": "swv2", "ca": "ca2"}})
+
+    assert result["samples"] == 2
+    assert result["data_vars"] == ["parameters"]
+    assert driver.input.parameters.dims == ("sample", "parameter")
+    assert driver.input.parameter.values.tolist() == ["pulse_size", "step_size", "frequency", "step2_time"]
+    assert driver.input.parameters.values.tolist() == [[0.025, 0.002, 25.0, 60.0]] * 2
+    assert driver.input.parameters_swv_entry_id.values.tolist() == ["run_documents/swv", "run_documents/swv2"]
+    assert driver.input.parameters_ca_entry_id.values.tolist() == ["run_documents/ca", "run_documents/ca2"]
+    with pytest.raises(ValueError, match="already present"):
+        driver.append_dataset({"parameters": {"swv": "swv2", "ca": "ca2"}})
+
+
+def test_constructed_parameters_mix_drivers_dataset_metadata_and_legacy(monkeypatch):
+    items = _parameter_items()
+    items["swv"].metadata["attrs"]["driver_name"] = "OtherDriver"
+    items["swv"].dataset = xr.Dataset({"pulse_size": 0.025, "step_size": 0.002, "frequency": 25.0})
+    spec = _parameter_spec()
+    parameters = spec["sources"]["parameters"]
+    parameters["inputs"]["swv"].update(driver_name="OtherDriver", source="dataset")
+    for label in ("pulse_size", "step_size", "frequency"):
+        parameters["mapping"][label]["path"] = label
+    spec["sources"]["duration"] = {
+        **parameters["inputs"]["ca"], "path": "attrs.parameters.step2_time",
+    }
+    driver = _collection_driver(items)
+    lookups, reads = [], []
+    monkeypatch.setattr(driver, "_get_tiled_item_by_id", lambda entry_id: (
+        lookups.append(entry_id) or f"run_documents/{entry_id}", items[entry_id]
+    ))
+    monkeypatch.setattr(driver, "_read_tiled_item", lambda item: reads.append(item) or item.dataset)
+    driver.setup_data_collection(spec)
+    driver.append_dataset({"parameters": {"swv": "swv", "ca": "ca"}, "duration": "run_documents/ca"})
+
+    assert driver.input.parameters.values.tolist() == [[0.025, 0.002, 25.0, 60.0]]
+    assert driver.input.duration.values.tolist() == [60.0]
+    assert lookups == ["swv", "ca"]
+    assert len(reads) == 1
+
+
+@pytest.mark.parametrize("change, message", [
+    (lambda source: source.update(path="legacy"), "cannot mix"),
+    (lambda source: source.update(inputs={}), "non-empty dictionary"),
+    (lambda source: source["inputs"]["swv"].pop("driver_name"), "required string keys"),
+    (lambda source: source.update(mapping={}), "non-empty dictionary"),
+    (lambda source: source["mapping"]["pulse_size"].update(input="unknown"), "unknown input"),
+    (lambda source: source["mapping"]["pulse_size"].update(input=[]), "unknown input"),
+    (lambda source: source["mapping"]["pulse_size"].update(path=["bad"]), "path string"),
+    (lambda source: source.update(mapping_to_vector=False), "mapping_to_vector=True"),
+    (lambda source: source.update(dims=["sample"]), "non-sample dims"),
+    (lambda source: source.update(dims=["a", "b"]), "non-sample dims"),
+    (lambda source: source.update(coords={"parameter": ["pulse_size"] * 4}), "exactly once"),
+])
+def test_constructed_spec_validation(change, message):
+    driver = _collection_driver({})
+    spec = _parameter_spec()
+    change(spec["sources"]["parameters"])
+    with pytest.raises(ValueError, match=message):
+        driver.setup_data_collection(spec)
+    assert driver.config["data_collection"] is None
+
+
+@pytest.mark.parametrize("change, message", [
+    (lambda attrs: attrs.update(sample_uuid="other-sample"), "same sample ID"),
+    (lambda attrs: attrs.update(AL_campaign_name="other-campaign"), "does not match campaign"),
+    (lambda attrs: attrs.update(task_name="wrong-task"), "driver_name/task_name"),
+    (lambda attrs: attrs.pop("sample_uuid"), "no sample ID"),
+    (lambda attrs: attrs["parameters"].pop("step2_time"), "no metadata path"),
+    (lambda attrs: attrs["parameters"].update(step2_time=[60.0]), "must be scalar"),
+    (lambda attrs: attrs["parameters"].update(step2_time="invalid"), "must be numeric"),
+])
+def test_constructed_append_failure_preserves_input(change, message):
+    items = _parameter_items()
+    driver = _collection_driver(items)
+    driver.setup_data_collection(_parameter_spec())
+    driver.append_dataset({"parameters": {"swv": "swv", "ca": "ca"}})
+    original = driver.input.copy(deep=True)
+    next_items = _parameter_items("SAM-002")
+    change(next_items["ca"].metadata["attrs"])
+    items.update({f"{name}2": item for name, item in next_items.items()})
+    with pytest.raises(ValueError, match=message):
+        driver.append_dataset({"parameters": {"swv": "swv2", "ca": "ca2"}})
+    xr.testing.assert_identical(driver.input, original)
+
+
+@pytest.mark.parametrize("entries", [
+    {"parameters": "swv"},
+    {"parameters": {"swv": "swv"}},
+    {"parameters": {"swv": "swv", "ca": "ca", "extra": "ca"}},
+    {"parameters": {"swv": "swv", "ca": None}},
+])
+def test_constructed_append_rejects_invalid_entries(entries):
+    driver = _collection_driver(_parameter_items())
+    driver.setup_data_collection(_parameter_spec())
+    with pytest.raises(ValueError, match="keys must exactly match|entry ID"):
+        driver.append_dataset(entries)
+    assert driver.input is None
+
+
+@pytest.mark.parametrize("dataset, message", [
+    (xr.Dataset(), "no variable"),
+    (xr.Dataset({"step2_time": ("time", [60.0])}), "must be scalar"),
+    (xr.DataArray(60.0), "not an xarray Dataset"),
+])
+def test_constructed_dataset_extraction_errors(dataset, message):
+    items = _parameter_items()
+    items["ca"].dataset = dataset
+    spec = _parameter_spec()
+    source = spec["sources"]["parameters"]
+    source["inputs"]["ca"]["source"] = "dataset"
+    source["mapping"]["step2_time"]["path"] = "step2_time"
+    driver = _collection_driver(items)
+    driver.setup_data_collection(spec)
+    with pytest.raises(ValueError, match=message):
+        driver.append_dataset({"parameters": {"swv": "swv", "ca": "ca"}})
+    assert driver.input is None
+
+
+def test_constructed_spec_and_entries_accept_json_and_custom_sample_dim():
+    import json
+
+    driver = _collection_driver(_parameter_items())
+    spec = _parameter_spec()
+    spec["sample_dim"] = "specimen"
+    driver.setup_data_collection(json.dumps(spec))
+    driver.append_dataset(json.dumps({"parameters": {"swv": "swv", "ca": "ca"}}))
+    assert driver.input.parameters.dims == ("specimen", "parameter")
+    assert driver.input.parameters.values.tolist() == [[0.025, 0.002, 25.0, 60.0]]

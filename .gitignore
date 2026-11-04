@@ -18,6 +18,10 @@ venv/
 .cursor/
 .cursor-cache/
 
+# Jupyter Notebook
+.ipynb_checkpoints/
+**/.ipynb_checkpoints/
+
 # Sphinx documentation
 docs/build/
 docs/source/reference/_autosummary/

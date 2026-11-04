@@ -9,6 +9,7 @@ Guides for specific tasks
    building_xarray_datasets
    create_pipelineop
    appending
+   data_collection
    autosas_modal_selection
    saving_pipelines
    pipeline_builder
