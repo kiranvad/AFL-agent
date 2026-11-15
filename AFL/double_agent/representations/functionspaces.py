@@ -205,6 +205,15 @@ def _inertia(res) -> float:
     return float(np.sum(d_amplitude[np.arange(labels.size), labels] ** 2))
 
 
+def _same_clustering(labels1: np.ndarray, labels2: np.ndarray) -> bool:
+    """Whether two label arrays describe the same partition (up to relabeling)."""
+    pairs = np.unique(np.stack([labels1, labels2]), axis=1)
+    return (
+        np.unique(pairs[0]).size == pairs.shape[1]
+        and np.unique(pairs[1]).size == pairs.shape[1]
+    )
+
+
 def _fit_n_phases(
     data: _FunctionalData,
     n_phases: int,
@@ -212,24 +221,31 @@ def _fit_n_phases(
     random_state: np.random.RandomState,
     fit_kwargs: Dict,
 ):
-    """Run elastic k-means from ``n_init`` k-means++ starts and keep the best run.
+    """Run elastic k-means from up to ``n_init`` k-means++ starts and keep the best run.
 
-    The best run has the lowest k-means objective (:func:`_inertia`). autophasemap's
-    ``error`` is not used: it is the template change in the last iteration, a
-    convergence measure that says nothing about the quality of the clustering.
+    Follows ``autophasemap.clustering.multi_kmeans_run``: the best run is the one
+    that converged furthest (lowest ``error``, the relative template change in the
+    last iteration). A new run only replaces the best one if it gives a different
+    clustering (not just a permutation of the labels), and restarts stop early once
+    the best ``error`` is below the convergence ``threshold``.
 
     Returns the autophasemap result of the best run and its BIC (``inf`` if BIC
     cannot be computed).
     """
-    best, best_inertia = None, np.inf
+    threshold = fit_kwargs.get("threshold", 1e-2)
+    best = None
     for _ in range(n_init):
         _, init_idx = kmeans_plusplus(data.C, n_clusters=n_phases, random_state=random_state)
         res = compute_elastic_kmeans(
             data, init_idx, verbose=0, random_state=random_state, **fit_kwargs
         )
-        inertia = _inertia(res)
-        if best is None or inertia < best_inertia:
-            best, best_inertia = res, inertia
+        if best is None or (
+            res.error < best.error
+            and not _same_clustering(np.asarray(res.delta_n), np.asarray(best.delta_n))
+        ):
+            best = res
+        if best.error < threshold:
+            break
     try:
         bic = float(compute_BIC(data, best.fik_gam, best.qik_gam, best.delta_n))
     except Exception as exc:  # degenerate fPCA / singular covariance
@@ -311,8 +327,9 @@ class ElasticKMeansClustering(PipelineOp):
         Number of phases, or candidate numbers of phases; with a list, the candidate
         with the lowest BIC is selected.
     n_init : int, default=3
-        Number of k-means++ initializations per number of phases; the run with the
-        lowest sum of squared elastic distances to its templates is kept.
+        Maximum number of k-means++ initializations per number of phases. As in
+        autophasemap, the best converged run (lowest final template change) is kept
+        and restarts stop once it is below ``threshold``.
     max_iter : int, default=50
         Maximum number of elastic k-means iterations per initialization.
     threshold : float, default=1e-2

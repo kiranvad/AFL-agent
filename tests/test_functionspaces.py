@@ -171,24 +171,52 @@ def test_phase_reordering_keeps_arrays_consistent():
 
 
 @pytest.mark.unit
-def test_best_run_is_chosen_by_objective_not_error(monkeypatch):
-    """autophasemap's `error` is a convergence measure; restarts are ranked by inertia."""
-    labels = np.array([0, 0, 1, 1])
-    good = _fake_result(labels, 2)._replace(
-        d_amplitude=np.array([[0.1, 1.0], [0.1, 1.0], [1.0, 0.1], [1.0, 0.1]]), error=0.5
-    )
-    bad = _fake_result(labels, 2)._replace(
-        d_amplitude=np.array([[0.9, 1.0], [0.9, 1.0], [1.0, 0.9], [1.0, 0.9]]), error=0.001
-    )
-    runs = iter([bad, good])
-    monkeypatch.setattr(fs, "kmeans_plusplus", lambda C, n_clusters, random_state: (None, np.arange(n_clusters)))
-    monkeypatch.setattr(fs, "compute_elastic_kmeans", lambda *args, **kwargs: next(runs))
-    monkeypatch.setattr(fs, "compute_BIC", lambda *args: 1.0)
+def test_same_clustering():
+    assert fs._same_clustering(np.array([0, 0, 1, 2]), np.array([2, 2, 0, 1]))
+    assert not fs._same_clustering(np.array([0, 0, 1, 1]), np.array([0, 1, 1, 1]))
+    assert not fs._same_clustering(np.array([0, 0, 1, 1]), np.array([0, 0, 1, 2]))
 
+
+def _run_fit(monkeypatch, runs, n_init, threshold=1e-2):
+    calls = []
+
+    def fake_kmeans(*args, **kwargs):
+        calls.append(1)
+        return next(runs)
+
+    monkeypatch.setattr(fs, "kmeans_plusplus", lambda C, n_clusters, random_state: (None, np.arange(n_clusters)))
+    monkeypatch.setattr(fs, "compute_elastic_kmeans", fake_kmeans)
+    monkeypatch.setattr(fs, "compute_BIC", lambda *args: 1.0)
     data = fs._FunctionalData(t=np.linspace(0, 1, 4), F=[np.zeros(4)] * 4, C=np.zeros((4, 2)))
-    best, bic = fs._fit_n_phases(data, 2, n_init=2, random_state=np.random.RandomState(0), fit_kwargs={})
-    assert best is good and bic == 1.0
-    assert fs._inertia(good) == pytest.approx(4 * 0.1**2)
+    best, bic = fs._fit_n_phases(
+        data, 2, n_init=n_init, random_state=np.random.RandomState(0), fit_kwargs={"threshold": threshold}
+    )
+    return best, bic, len(calls)
+
+
+@pytest.mark.unit
+def test_best_run_is_chosen_by_convergence_error(monkeypatch):
+    """As in autophasemap.multi_kmeans_run, restarts are ranked by the convergence error."""
+    first = _fake_result([0, 0, 1, 1], 2)._replace(error=0.5)
+    better = _fake_result([0, 1, 1, 1], 2)._replace(error=0.1)
+    worse = _fake_result([0, 0, 0, 1], 2)._replace(error=0.3)
+    best, bic, n_calls = _run_fit(monkeypatch, iter([first, better, worse]), n_init=3)
+    assert best is better and bic == 1.0 and n_calls == 3
+
+
+@pytest.mark.unit
+def test_same_clustering_does_not_replace_best_run(monkeypatch):
+    first = _fake_result([0, 0, 1, 1], 2)._replace(error=0.5)
+    relabeled = _fake_result([1, 1, 0, 0], 2)._replace(error=0.1)
+    best, _, _ = _run_fit(monkeypatch, iter([first, relabeled]), n_init=2)
+    assert best is first
+
+
+@pytest.mark.unit
+def test_restarts_stop_once_converged(monkeypatch):
+    converged = _fake_result([0, 0, 1, 1], 2)._replace(error=1e-3)
+    best, _, n_calls = _run_fit(monkeypatch, iter([converged]), n_init=5)
+    assert best is converged and n_calls == 1
 
 
 @pytest.mark.unit
