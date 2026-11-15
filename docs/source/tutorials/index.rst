@@ -10,6 +10,7 @@ Step-by-step guides for beginners to use AFL-agent
    quickstart
    building_pipelines
    bayesopt
+   elastic_kmeans_active_learning
    visualization
    autosas_fitting
    interactive

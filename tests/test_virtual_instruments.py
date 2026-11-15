@@ -6,7 +6,7 @@ import numpy as np
 import xarray as xr
 import pytest
 
-from AFL.double_agent.VirtualInstruments import GaussianVirtualInstrument
+from AFL.double_agent.VirtualInstruments import GaussianVirtualInstrument, ParabolicPhaseMap
 
 
 def test_gaussian_virtual_instrument_measures_batches(tmp_path):
@@ -67,6 +67,94 @@ def test_gaussian_virtual_instrument_works_without_afl_automation(tmp_path):
     )
 
     subprocess.run([sys.executable, "-c", script], check=True)
+
+
+def _count_peaks(curve):
+    return int((np.diff(np.sign(np.diff(curve))) < 0).sum())
+
+
+def test_parabolic_phase_map_measures_any_composition(tmp_path):
+    instrument = ParabolicPhaseMap(afl_home=tmp_path)
+    compositions = np.random.default_rng(0).random((50, 2))
+    result = instrument.measure(compositions)
+
+    assert result["composition"].dims == ("sample", "component")
+    assert result["measurement"].dims == ("sample", "t")
+    assert result["measurement"].shape == (50, 100)
+    np.testing.assert_array_equal(result["component"], ["x", "y"])
+    np.testing.assert_allclose(result["t"], np.linspace(0, 1, 100))
+    np.testing.assert_allclose(result["composition"], compositions)
+    # phase p has p peaks
+    peaks = [_count_peaks(curve) for curve in result["measurement"].values]
+    np.testing.assert_array_equal(peaks, result["ground_truth_labels"])
+
+
+def test_parabolic_phase_map_design_space_is_unit_square(tmp_path):
+    instrument = ParabolicPhaseMap(afl_home=tmp_path)
+    assert instrument.DESIGN_SPACE == {"x": (0.0, 1.0), "y": (0.0, 1.0)}
+    assert instrument.components == ["x", "y"]
+    assert instrument.config["component_limits"] == {"x": [0.0, 1.0], "y": [0.0, 1.0]}
+    instrument.measure([[0.0, 0.0], [1.0, 1.0]])  # corners are inside
+
+
+@pytest.mark.parametrize(
+    "compositions,message",
+    [
+        ([[1.2, 0.5]], "design space"),
+        ([[0.5, -0.1]], "design space"),
+        ([[0.5, 0.5, 0.5]], "shape"),
+        ([[np.nan, 0.5]], "finite"),
+    ],
+)
+def test_parabolic_phase_map_rejects_invalid_compositions(tmp_path, compositions, message):
+    with pytest.raises(ValueError, match=message):
+        ParabolicPhaseMap(afl_home=tmp_path).measure(compositions)
+
+
+def test_parabolic_phase_map_labels(tmp_path):
+    instrument = ParabolicPhaseMap(afl_home=tmp_path)
+    points = np.array([[0.5, 0.95], [0.5, 0.05], [0.5, 0.5], [1.0, 0.97], [1.0, 0.08]])
+    np.testing.assert_array_equal(instrument.phase_labels(points), [1, 2, 3, 1, 2])
+    assert instrument.label_for([0.5, 0.5]) == (3, True)
+
+    # 12x12 grid of the autophasemap example
+    x = np.linspace(0, 1, 12)
+    grid = np.stack(np.meshgrid(x, x), axis=-1).reshape(-1, 2)
+    _, counts = np.unique(instrument.phase_labels(grid), return_counts=True)
+    np.testing.assert_array_equal(counts, [56, 55, 33])
+
+
+def test_parabolic_phase_map_is_seeded_and_draws_new_curves(tmp_path):
+    points = [[0.3, 0.9], [0.7, 0.2]]
+    a = ParabolicPhaseMap(afl_home=tmp_path).measure(points)
+    b = ParabolicPhaseMap(afl_home=tmp_path).measure(points)
+    xr.testing.assert_equal(a, b)  # same seed, same measurements
+
+    other = ParabolicPhaseMap(overrides={"random_seed": 1}, afl_home=tmp_path).measure(points)
+    assert not np.allclose(a["measurement"], other["measurement"])
+
+    instrument = ParabolicPhaseMap(afl_home=tmp_path)
+    first = instrument.measure([[0.3, 0.9]])["measurement"].values
+    second = instrument.measure([[0.3, 0.9]])["measurement"].values
+    assert not np.allclose(first, second)  # every measurement draws a new warping
+
+
+def test_parabolic_phase_map_noise_and_domain_size(tmp_path):
+    clean = ParabolicPhaseMap(overrides={"n_domain": 40}, afl_home=tmp_path).measure([[0.5, 0.5]])
+    noisy = ParabolicPhaseMap(overrides={"n_domain": 40, "noise": 0.05}, afl_home=tmp_path).measure(
+        [[0.5, 0.5]]
+    )
+    assert clean["measurement"].shape == (1, 40)
+    residual = noisy["measurement"].values - clean["measurement"].values
+    assert 0.02 < residual.std() < 0.1
+
+
+def test_parabolic_phase_map_ground_truth_for_benchmarking(tmp_path):
+    from AFL.double_agent.benchmarking import virtual_instrument_labels
+
+    instrument = ParabolicPhaseMap(afl_home=tmp_path)
+    X = np.random.default_rng(1).random((200, 2))
+    np.testing.assert_array_equal(virtual_instrument_labels(instrument, X), instrument.phase_labels(X))
 
 
 @pytest.fixture(scope="module")

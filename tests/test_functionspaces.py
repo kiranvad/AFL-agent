@@ -1,5 +1,6 @@
 """Tests for ElasticKMeansClustering (elastic k-means phase mapping via autophasemap)."""
 
+import warnings
 from collections import namedtuple
 from importlib.util import find_spec
 
@@ -127,6 +128,10 @@ def test_validate_problem_neighbors_and_freq():
         fs._validate_problem(4, 50, [2], n_neighbors=4, num_freq=2)
     with pytest.warns(UserWarning, match="no effect"):
         fs._validate_problem(10, 50, [2], n_neighbors=3, num_freq=30)
+    # smoothing off: neighbors and frequencies are not used, so not checked
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        fs._validate_problem(4, 50, [2], n_neighbors=None, num_freq=None)
 
 
 _FakeResult = namedtuple("_FakeResult", "templates gam_ik qik_gam fik_gam delta_n dist d_amplitude error")
@@ -163,6 +168,27 @@ def test_phase_reordering_keeps_arrays_consistent():
         np.testing.assert_array_equal(out["d_amplitude"][:, new], old)
         np.testing.assert_array_equal(out["fik_gam"][:, new], old)
         np.testing.assert_array_equal(out["gam_ik"][:, new], old)
+
+
+@pytest.mark.unit
+def test_best_run_is_chosen_by_objective_not_error(monkeypatch):
+    """autophasemap's `error` is a convergence measure; restarts are ranked by inertia."""
+    labels = np.array([0, 0, 1, 1])
+    good = _fake_result(labels, 2)._replace(
+        d_amplitude=np.array([[0.1, 1.0], [0.1, 1.0], [1.0, 0.1], [1.0, 0.1]]), error=0.5
+    )
+    bad = _fake_result(labels, 2)._replace(
+        d_amplitude=np.array([[0.9, 1.0], [0.9, 1.0], [1.0, 0.9], [1.0, 0.9]]), error=0.001
+    )
+    runs = iter([bad, good])
+    monkeypatch.setattr(fs, "kmeans_plusplus", lambda C, n_clusters, random_state: (None, np.arange(n_clusters)))
+    monkeypatch.setattr(fs, "compute_elastic_kmeans", lambda *args, **kwargs: next(runs))
+    monkeypatch.setattr(fs, "compute_BIC", lambda *args: 1.0)
+
+    data = fs._FunctionalData(t=np.linspace(0, 1, 4), F=[np.zeros(4)] * 4, C=np.zeros((4, 2)))
+    best, bic = fs._fit_n_phases(data, 2, n_init=2, random_state=np.random.RandomState(0), fit_kwargs={})
+    assert best is good and bic == 1.0
+    assert fs._inertia(good) == pytest.approx(4 * 0.1**2)
 
 
 @pytest.mark.unit
@@ -373,3 +399,71 @@ def test_pipeline_on_example_dataset(ray_session, example_dataset1):
     out = pipeline.calculate(example_dataset1)
     # 1.0 observed
     assert adjusted_rand_score(out["ground_truth_labels"], out["elastic_kmeans_labels"]) > 0.9
+
+
+@requires_autophasemap
+@pytest.mark.integration
+def test_active_learning_loop_with_parabolic_phase_map(ray_session, tmp_path):
+    """Two iterations of the tutorial's campaign with small settings."""
+    from AFL.double_agent import Pipeline
+    from AFL.double_agent.AcquisitionFunction import MaxValueAF
+    from AFL.double_agent.benchmarking import PhaseMapF1Score, latin_hypercube
+    from AFL.double_agent.Generator import CartesianGrid
+    from AFL.double_agent.PyTorchExtrapolator import DirichletGPExtrapolator
+    from AFL.double_agent.VirtualInstruments import ParabolicPhaseMap
+
+    sim = ParabolicPhaseMap(overrides={"n_domain": 50}, afl_home=tmp_path)
+    limits = dict(sim.DESIGN_SPACE)
+    with Pipeline("elastic_kmeans_al") as pipeline:
+        CartesianGrid(
+            output_variable="grid_points",
+            sample_dim="grid",
+            component_dim="component",
+            grid_spec={c: {"min": 0.0, "max": 1.0, "steps": 10} for c in limits},
+        )
+        ElasticKMeansClustering(
+            functions_variable="measurement",
+            components_variable="composition",
+            output_prefix="clusters",
+            n_phases=3,
+            n_init=1,
+            max_iter=5,
+            smoothen=False,
+            num_cpus=2,
+        )
+        DirichletGPExtrapolator(
+            feature_input_variable="composition",
+            predictor_input_variable="clusters_labels",
+            output_prefix="phase",
+            grid_variable="grid_points",
+            grid_dim="grid",
+            sample_dim="sample",
+            component_dim="component",
+            params={"method": "mll", "n_iterations": 20},
+            bounds=limits,
+            model_uri=str(tmp_path / "models"),
+        )
+        PhaseMapF1Score(ground_truth=sim, n_per_phase=20, n_pool=500, match_labels=True)
+        MaxValueAF(
+            input_variables=["phase_entropy"],
+            grid_variable="grid_points",
+            grid_dim="grid",
+            output_variable="next_composition",
+            excluded_comps_variables=["composition"],
+            excluded_comps_dim="component",
+            exclusion_radius=1e-3,
+            sample_dim="next_sample",
+        )
+
+    np.random.seed(0)
+    measured = sim.measure(latin_hypercube(limits, 9, seed=0))
+    for _ in range(2):
+        result = pipeline.calculate(measured, disable_progress_bar=True)
+        assert 0.0 <= result["benchmark_f1"].item() <= 1.0
+        nxt = result["next_composition"].transpose("next_sample", "component").values
+        assert nxt.shape == (1, 2) and np.all((nxt >= 0) & (nxt <= 1))
+        distances = np.linalg.norm(measured["composition"].values - nxt, axis=1)
+        assert distances.min() > 0  # never re-measures a composition
+        new = sim.measure(nxt).assign_coords(sample=[measured.sizes["sample"]])
+        measured = xr.concat([measured, new], dim="sample")
+    assert measured.sizes["sample"] == 11

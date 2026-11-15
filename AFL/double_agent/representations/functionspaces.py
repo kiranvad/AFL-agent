@@ -133,9 +133,14 @@ def _validate_problem(
     n_samples: int,
     n_domain: int,
     candidates: Sequence[int],
-    n_neighbors: int,
-    num_freq: int,
+    n_neighbors: Optional[int],
+    num_freq: Optional[int],
 ) -> None:
+    """Check that the problem can be clustered.
+
+    ``n_neighbors`` and ``num_freq`` only matter for diffusion smoothing; pass ``None``
+    to skip their checks when smoothing is off.
+    """
     if n_domain < _MIN_DOMAIN_POINTS:
         raise ValueError(
             f"Need at least {_MIN_DOMAIN_POINTS} points along the function domain, got {n_domain}"
@@ -147,11 +152,11 @@ def _validate_problem(
             f"{n_samples} samples cannot support {max(candidates)} phases "
             f"(each phase needs at least {_MIN_CLUSTER_SIZE} samples)"
         )
-    if n_neighbors >= n_samples:
+    if n_neighbors is not None and n_neighbors >= n_samples:
         raise ValueError(
             f"n_neighbors ({n_neighbors}) must be smaller than the number of samples ({n_samples})"
         )
-    if num_freq >= n_samples:
+    if num_freq is not None and num_freq >= n_samples:
         warnings.warn(
             f"num_freq ({num_freq}) >= number of samples ({n_samples}): "
             "diffusion smoothing will have no effect",
@@ -193,6 +198,13 @@ def _quiet_logger(name: str = "pygsp", level: int = logging.WARNING) -> Iterator
         logger.setLevel(old_level)
 
 
+def _inertia(res) -> float:
+    """Elastic k-means objective: sum of squared amplitude distances to the assigned templates."""
+    d_amplitude = np.asarray(res.d_amplitude)
+    labels = np.asarray(res.delta_n)
+    return float(np.sum(d_amplitude[np.arange(labels.size), labels] ** 2))
+
+
 def _fit_n_phases(
     data: _FunctionalData,
     n_phases: int,
@@ -200,19 +212,24 @@ def _fit_n_phases(
     random_state: np.random.RandomState,
     fit_kwargs: Dict,
 ):
-    """Run elastic k-means from ``n_init`` k-means++ starts and keep the lowest-error run.
+    """Run elastic k-means from ``n_init`` k-means++ starts and keep the best run.
+
+    The best run has the lowest k-means objective (:func:`_inertia`). autophasemap's
+    ``error`` is not used: it is the template change in the last iteration, a
+    convergence measure that says nothing about the quality of the clustering.
 
     Returns the autophasemap result of the best run and its BIC (``inf`` if BIC
     cannot be computed).
     """
-    best = None
+    best, best_inertia = None, np.inf
     for _ in range(n_init):
         _, init_idx = kmeans_plusplus(data.C, n_clusters=n_phases, random_state=random_state)
         res = compute_elastic_kmeans(
             data, init_idx, verbose=0, random_state=random_state, **fit_kwargs
         )
-        if best is None or res.error < best.error:
-            best = res
+        inertia = _inertia(res)
+        if best is None or inertia < best_inertia:
+            best, best_inertia = res, inertia
     try:
         bic = float(compute_BIC(data, best.fik_gam, best.qik_gam, best.delta_n))
     except Exception as exc:  # degenerate fPCA / singular covariance
@@ -242,6 +259,7 @@ def _apply_order(res, order: np.ndarray) -> Dict:
         fik_gam=np.asarray(res.fik_gam)[:, order],
         gam_ik=np.asarray(res.gam_ik)[:, order],
         error=float(res.error),
+        inertia=_inertia(res),
     )
 
 
@@ -293,7 +311,8 @@ class ElasticKMeansClustering(PipelineOp):
         Number of phases, or candidate numbers of phases; with a list, the candidate
         with the lowest BIC is selected.
     n_init : int, default=3
-        Number of k-means++ initializations per number of phases.
+        Number of k-means++ initializations per number of phases; the run with the
+        lowest sum of squared elastic distances to its templates is kept.
     max_iter : int, default=50
         Maximum number of elastic k-means iterations per initialization.
     threshold : float, default=1e-2
@@ -332,7 +351,9 @@ class ElasticKMeansClustering(PipelineOp):
     -----
     Outputs, with ``p`` the ``output_prefix`` and phase dimension ``p_phase``:
 
-    - ``p_labels`` (sample): phase label of each sample; attrs ``n_phases``, ``error``, ``bic``
+    - ``p_labels`` (sample): phase label of each sample; attrs ``n_phases``, ``inertia``
+      (sum of squared elastic distances to the templates), ``error`` (last template
+      change) and ``bic``
     - ``p_templates`` (p_phase, domain): template function of each phase
     - ``p_amplitude_distance`` (sample, p_phase): elastic amplitude distance to each template
     - ``p_distance`` (sample, p_phase): distance after diffusion smoothing (used for labels)
@@ -464,7 +485,13 @@ class ElasticKMeansClustering(PipelineOp):
         functions, components, domain_dim = self._extract(dataset)
         data = self._build_data(functions, components, domain_dim)
         candidates = self._candidates()
-        _validate_problem(data.N, data.n_domain, candidates, self.n_neighbors, self.num_freq)
+        _validate_problem(
+            data.N,
+            data.n_domain,
+            candidates,
+            self.n_neighbors if self.smoothen else None,
+            self.num_freq if self.smoothen else None,
+        )
 
         random_state = np.random.RandomState(self.seed)
         fits, bics = {}, {}
@@ -501,7 +528,12 @@ class ElasticKMeansClustering(PipelineOp):
             res["labels"],
             dims=[sample_dim],
             coords=sample_coords,
-            attrs={"n_phases": n_phases, "error": res["error"], "bic": bics[n_phases]},
+            attrs={
+                "n_phases": n_phases,
+                "inertia": res["inertia"],
+                "error": res["error"],
+                "bic": bics[n_phases],
+            },
         )
         self.output[self._prefix_output("templates")] = xr.DataArray(
             res["templates"],

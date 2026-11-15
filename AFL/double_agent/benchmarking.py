@@ -33,6 +33,7 @@ from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple, Unio
 
 import numpy as np
 import xarray as xr
+from scipy.optimize import linear_sum_assignment
 from scipy.stats import qmc
 from sklearn.metrics import f1_score
 from typing_extensions import Self
@@ -40,7 +41,13 @@ from typing_extensions import Self
 from AFL.double_agent.PipelineOp import PipelineOp
 from AFL.double_agent.spec import resolve_function
 
-__all__ = ["PhaseMapF1Score", "latin_hypercube", "virtual_instrument_labels", "stratified_test_set"]
+__all__ = [
+    "PhaseMapF1Score",
+    "latin_hypercube",
+    "match_labels",
+    "virtual_instrument_labels",
+    "stratified_test_set",
+]
 
 Bounds = Mapping[str, Tuple[float, float]]
 
@@ -116,6 +123,41 @@ def stratified_test_set(
     return pool[keep], labels[keep]
 
 
+def match_labels(y_true: np.ndarray, y_pred: np.ndarray) -> Tuple[np.ndarray, Dict[Any, Any]]:
+    """Rename predicted labels to the true labels they agree with most.
+
+    For unsupervised labels (e.g. cluster indices) whose values carry no meaning, the
+    one-to-one mapping of predicted to true labels that maximises the number of agreeing
+    points is found with the Hungarian algorithm on the contingency table. Predicted
+    labels left without a partner (more predicted than true phases) are mapped to new
+    labels that match no true phase, so they count as errors. ``y_true`` and ``y_pred``
+    must have the same dtype. Returns the relabelled predictions and the mapping.
+    """
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    true_classes = np.unique(y_true)
+    pred_classes = np.unique(y_pred)
+    contingency = np.array(
+        [[np.sum((y_pred == p) & (y_true == t)) for t in true_classes] for p in pred_classes]
+    )
+    rows, cols = linear_sum_assignment(-contingency)
+    mapping = {pred_classes[r].item(): true_classes[c].item() for r, c in zip(rows, cols)}
+
+    unmatched = [p.item() for p in pred_classes if p.item() not in mapping]
+    if unmatched:
+        if np.issubdtype(y_true.dtype, np.integer):
+            start = int(true_classes.max()) + 1
+            extra = {p: start + i for i, p in enumerate(unmatched)}
+        else:
+            extra = {p: f"unmatched_{p}" for p in unmatched}
+        mapping.update(extra)
+
+    relabelled = np.array([mapping[p.item()] for p in y_pred.reshape(-1)])
+    if relabelled.size == 0:
+        relabelled = relabelled.astype(y_true.dtype)
+    return relabelled, mapping
+
+
 def _default_predict(model, X: np.ndarray):
     """Most probable class of ``model`` at ``X``: the first output of ``model.predict`` (or all of it)."""
     out = model.predict(X)
@@ -150,6 +192,12 @@ class PhaseMapF1Score(PipelineOp):
     average : str | None
         ``sklearn.metrics.f1_score`` averaging: ``"weighted"`` (default), ``"macro"``,
         ``"micro"`` or ``None`` for one score per phase.
+    match_labels : bool, default=False
+        Rename the predicted labels to the true labels they agree with most before
+        scoring (see :func:`match_labels`). Use this when the model is trained on
+        unsupervised labels, e.g. cluster indices from
+        :class:`~AFL.double_agent.representations.functionspaces.ElasticKMeansClustering`,
+        whose values do not correspond to the ground-truth labels.
     n_per_phase, n_pool, seed : int
         Stratified test set settings, see :func:`stratified_test_set`.
     output_prefix : str
@@ -172,6 +220,7 @@ class PhaseMapF1Score(PipelineOp):
         n_pool: int = 20000,
         seed: int = 0,
         output_prefix: str = "benchmark",
+        match_labels: bool = False,
         name: str = "PhaseMapF1Score",
     ) -> None:
         super().__init__(
@@ -188,6 +237,7 @@ class PhaseMapF1Score(PipelineOp):
         self.n_per_phase = n_per_phase
         self.n_pool = n_pool
         self.seed = seed
+        self.match_labels = match_labels
         # filled by calculate(); the test set is drawn once and reused across iterations
         self.test_points: Optional[np.ndarray] = None
         self.test_labels: Optional[np.ndarray] = None
@@ -245,6 +295,9 @@ class PhaseMapF1Score(PipelineOp):
         y_pred = _as_labels(y_pred)
         if y_pred.dtype != y_true.dtype:  # one side integer-like, the other not: compare as strings
             y_true, y_pred = y_true.astype(str), y_pred.astype(str)
+        label_mapping = None
+        if self.match_labels:
+            y_pred, label_mapping = match_labels(y_true, y_pred)
 
         phases = np.unique(y_true)
         f1 = f1_score(y_true, y_pred, labels=phases, average=self.average, zero_division=0)
@@ -258,6 +311,8 @@ class PhaseMapF1Score(PipelineOp):
             "n_phases_predicted": int(np.unique(y_pred).size),
             "n_points": int(y_true.size),
         }
+        if label_mapping is not None:
+            self.score["label_mapping"] = label_mapping
 
         p = self.output_prefix
         phase_dim, test_dim = f"{p}_phase", f"{p}_test"

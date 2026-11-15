@@ -109,6 +109,156 @@ class GaussianVirtualInstrument(VirtualInstrument):
         return [self.status_txt]
 
 
+class ParabolicPhaseMap(VirtualInstrument):
+    """Three-phase map of randomly warped multi-peak curves on the unit square.
+
+    Port of the synthetic phase map of ``autophasemap`` (``tests/synthetic.py`` and
+    ``example.ipynb`` in https://github.com/pozzo-research-group/autophasemap), which
+    follows Section 4 of the elastic k-means paper (https://arxiv.org/abs/2011.12397).
+    Instead of a fixed grid of samples, any composition in the design space
+    ``[0, 1] x [0, 1]`` can be measured.
+
+    The design space ``(x, y)`` is split by two parabolas, ``y = 0.5 x^2 + 0.45`` and
+    ``y = -0.45 x^2 + 0.55``, into three phases:
+
+    - phase 1, above the upper parabola: curves with 1 peak
+    - phase 2, below the lower parabola: curves with 2 peaks
+    - phase 3, between the parabolas: curves with 3 peaks
+
+    A phase-``p`` measurement on ``t`` in ``[0, 1]`` is
+    ``f(t) = sum_i z_i exp(-(gamma(t) - mu_i)^2 / (2 s^2))`` with ``mu_i = (2i - 1) / (2p)``,
+    ``s = 1 / (3p)``, random amplitudes ``z_i ~ N(1, amplitude_spread)`` and a random
+    warping of the domain ``gamma(t) = (exp(a t) - 1) / (exp(a) - 1)``,
+    ``a ~ U(-max_warp, max_warp)``, drawn anew for every measurement from a generator
+    seeded with ``random_seed``. Curves in one phase therefore share their number of
+    peaks but not the peak positions, which is what elastic (warping-invariant)
+    clustering such as
+    :class:`~AFL.double_agent.representations.functionspaces.ElasticKMeansClustering`
+    is designed for.
+
+    ``measure`` takes one composition row ``(x, y)`` or a batch and returns an xarray
+    dataset ready for AFL-agent pipelines. The ground-truth labels (1, 2, 3) are included
+    for benchmarking; :meth:`label_for` makes the instrument usable as ``ground_truth``
+    of :class:`~AFL.double_agent.benchmarking.PhaseMapF1Score`.
+    """
+
+    #: The design space: both components range over [0, 1].
+    DESIGN_SPACE = {"x": (0.0, 1.0), "y": (0.0, 1.0)}
+
+    defaults = {
+        "n_domain": 100,
+        "amplitude_spread": 0.1,
+        "max_warp": 3.0,
+        "noise": 0.0,
+        "random_seed": 0,
+    }
+
+    def __init__(
+        self,
+        overrides: dict | None = None,
+        afl_home: str | Path | None = None,
+    ) -> None:
+        # Like GaussianVirtualInstrument, this needs only Driver (no pyFAI).
+        self.app = None
+        _driver_init(self, "ParabolicPhaseMap", overrides, afl_home)
+        # fixed design space; exposed as component_limits like the SAS instruments so
+        # PhaseMapF1Score can read the bounds from the instrument
+        self.config["component_limits"] = {c: list(v) for c, v in self.DESIGN_SPACE.items()}
+        self.__instrument_name__ = "Parabolic Phase Map"
+        self.status_txt = "Idle"
+        self._rng = np.random.default_rng(int(self.config["random_seed"]))
+
+    @property
+    def components(self) -> list[str]:
+        """Names of the two composition components, in measurement column order."""
+        return list(self.DESIGN_SPACE)
+
+    @property
+    def t(self) -> np.ndarray:
+        """Domain of every measured curve."""
+        return np.linspace(0.0, 1.0, int(self.config["n_domain"]))
+
+    @staticmethod
+    def upper_boundary(x):
+        """Boundary between phases 1 (above) and 3."""
+        return 0.5 * np.asarray(x) ** 2 + 0.45
+
+    @staticmethod
+    def lower_boundary(x):
+        """Boundary between phases 3 and 2 (below)."""
+        return -0.45 * np.asarray(x) ** 2 + 0.55
+
+    def phase_labels(self, compositions) -> np.ndarray:
+        """Ground-truth phase (1, 2 or 3) of each composition row ``(x, y)``."""
+        compositions = np.atleast_2d(np.asarray(compositions, dtype=float))
+        x, y = compositions[:, 0], compositions[:, 1]
+        return np.where(
+            y > self.upper_boundary(x), 1, np.where(y < self.lower_boundary(x), 2, 3)
+        )
+
+    def label_for(self, composition) -> tuple[int, bool]:
+        """Phase of one composition; second value is always True (every point has a phase)."""
+        return int(self.phase_labels(composition)[0]), True
+
+    def _warping(self) -> np.ndarray:
+        a = self._rng.uniform(-float(self.config["max_warp"]), float(self.config["max_warp"]))
+        t = self.t
+        if np.isclose(a, 0.0):
+            return t
+        return np.expm1(a * t) / np.expm1(a)
+
+    def _curve(self, n_peaks: int) -> np.ndarray:
+        gamma = self._warping()
+        width = 1.0 / (3.0 * n_peaks)
+        curve = np.zeros_like(gamma)
+        for i in range(1, n_peaks + 1):
+            amplitude = self._rng.normal(1.0, float(self.config["amplitude_spread"]))
+            center = (2 * i - 1) / (2 * n_peaks)
+            curve += amplitude * np.exp(-((gamma - center) ** 2) / (2.0 * width**2))
+        return curve
+
+    def _validate(self, compositions) -> np.ndarray:
+        compositions = np.atleast_2d(np.asarray(compositions, dtype=float))
+        if compositions.ndim != 2 or compositions.shape[1] != 2:
+            raise ValueError("compositions must have shape (n_samples, 2)")
+        if not np.isfinite(compositions).all():
+            raise ValueError("compositions must be finite")
+        if np.any(compositions < -1e-9) or np.any(compositions > 1.0 + 1e-9):
+            raise ValueError("compositions must lie in the design space [0, 1] x [0, 1]")
+        return np.clip(compositions, 0.0, 1.0)
+
+    def measure(self, compositions) -> xr.Dataset:
+        """Measure one or more ``(x, y)`` compositions in ``[0, 1] x [0, 1]``.
+
+        Returns a dataset with ``composition`` (sample, component), ``measurement``
+        (sample, t) and ``ground_truth_labels`` (sample).
+        """
+        compositions = self._validate(compositions)
+        labels = self.phase_labels(compositions)
+        self.status_txt = f"Measuring {len(labels)} sample(s)"
+        curves = np.stack([self._curve(int(p)) for p in labels])
+        noise = float(self.config["noise"])
+        if noise > 0.0:
+            curves = curves + self._rng.normal(scale=noise, size=curves.shape)
+        self.status_txt = "Idle"
+
+        return xr.Dataset(
+            data_vars={
+                "composition": (("sample", "component"), compositions),
+                "measurement": (("sample", "t"), curves),
+                "ground_truth_labels": (("sample",), labels),
+            },
+            coords={
+                "sample": np.arange(compositions.shape[0]),
+                "component": self.components,
+                "t": self.t,
+            },
+        )
+
+    def status(self) -> list[str]:
+        return [self.status_txt]
+
+
 class VirtualSASInstrument(VirtualInstrument):
     """Base class for simulating small-angle scattering from a labelled phase diagram.
 
