@@ -5,7 +5,12 @@ import xarray as xr
 torch = pytest.importorskip("torch")
 pytest.importorskip("gpytorch")
 
-from AFL.double_agent.benchmarking import PhaseMapF1Score, latin_hypercube, stratified_test_set
+from AFL.double_agent.benchmarking import (
+    PhaseMapF1Score,
+    latin_hypercube,
+    match_labels,
+    stratified_test_set,
+)
 from AFL.double_agent.Pipeline import Pipeline
 from AFL.double_agent.PyTorchExtrapolator import DirichletGPExtrapolator
 
@@ -97,6 +102,60 @@ def test_phasemap_f1_score_predict_override(tmp_path):
     assert ds.benchmark_accuracy.item() == pytest.approx(1 / 3)
     assert ds.benchmark_n_phases_predicted.item() == 1
     np.testing.assert_allclose(ds.benchmark_recall.values, [0.0, 1.0, 0.0])
+
+
+def test_match_labels_undoes_a_permutation():
+    y_true = np.array([1, 1, 2, 2, 3, 3, 3])
+    y_pred = np.array([2, 2, 0, 0, 1, 1, 0])  # cluster indices, one point wrong
+    relabelled, mapping = match_labels(y_true, y_pred)
+    assert mapping == {2: 1, 0: 2, 1: 3}
+    np.testing.assert_array_equal(relabelled, [1, 1, 2, 2, 3, 3, 2])
+
+
+def test_match_labels_extra_predicted_classes_never_match():
+    y_true = np.array([0, 0, 1, 1])
+    y_pred = np.array([5, 5, 7, 9])  # three predicted classes for two true phases
+    relabelled, mapping = match_labels(y_true, y_pred)
+    assert mapping[5] == 0 and mapping[7] in (1, 2) and mapping[9] in (1, 2)
+    assert mapping[7] != mapping[9]
+    assert (relabelled == y_true).sum() == 3  # the unmatched class counts as wrong
+
+
+def test_match_labels_strings():
+    relabelled, mapping = match_labels(np.array(["L1", "L1", "H1"]), np.array(["b", "b", "a"]))
+    assert mapping == {"a": "H1", "b": "L1"}
+    np.testing.assert_array_equal(relabelled, ["L1", "L1", "H1"])
+    _, mapping = match_labels(np.array(["L1", "L1"]), np.array(["a", "b"]))
+    assert "unmatched_" in str(sorted(mapping.values()))
+
+
+def test_phasemap_f1_score_match_labels(tmp_path):
+    # a predictor that is right up to renaming the classes
+    permuted = {0: 2, 1: 0, 2: 1}
+
+    def renamed(model, X):
+        return np.vectorize(permuted.get)(ground_truth(X))
+
+    plain = make_pipeline(str(tmp_path), predict=renamed)
+    ds = plain.calculate(make_dataset(), disable_progress_bar=True)
+    assert ds.benchmark_accuracy.item() == pytest.approx(0.0)
+
+    matched = make_pipeline(str(tmp_path), predict=renamed, match_labels=True)
+    ds = matched.calculate(make_dataset(), disable_progress_bar=True)
+    assert ds.benchmark_f1.item() == pytest.approx(1.0)
+    assert ds.benchmark_accuracy.item() == pytest.approx(1.0)
+    op = matched.search("PhaseMapF1Score")
+    assert op.score["label_mapping"] == {v: k for k, v in permuted.items()}
+    assert "label_mapping" not in plain.search("PhaseMapF1Score").score
+
+
+def test_phasemap_f1_score_bounds_from_parabolic_phase_map(tmp_path):
+    from AFL.double_agent.VirtualInstruments import ParabolicPhaseMap
+
+    op = PhaseMapF1Score(ground_truth=ParabolicPhaseMap(afl_home=tmp_path), match_labels=True)
+    assert op.resolve_bounds() == {"x": (0.0, 1.0), "y": (0.0, 1.0)}
+    X, y = op.test_set()
+    assert set(np.unique(y)) == {1, 2, 3}
 
 
 def test_phasemap_f1_score_reuses_test_set(tmp_path):

@@ -12,6 +12,7 @@ Pipeline Operations
    benchmarking
    Boundary
    Extrapolator
+   functionspaces
    Generator
    MaskGrid
    PairMetric
