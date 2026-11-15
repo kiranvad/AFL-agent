@@ -98,6 +98,12 @@ apdist = [
     "apdist @ git+https://github.com/kiranvad/Amplitude-Phase-Distance"
 ]
 
+# elastic k-means phase mapping (representations/functionspaces.py); installs ray and
+# builds the warping C extension, so a C compiler is required
+autophasemap = [
+    "autophasemap @ git+https://github.com/pozzo-research-group/autophasemap"
+]
+
 # everything the manifold active learning examples need: Dirichlet GP classifier
 # (torch, gpytorch, pyro-ppl), BoTorch acquisition, SRSF Hilbert sphere (geoopt) and
 # the virtual SAS instrument (alphashape, trimesh)
